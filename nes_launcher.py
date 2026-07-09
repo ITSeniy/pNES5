@@ -1,12 +1,13 @@
 """
-EgyDevTeam NES Launcher
-Sends nes.lua to PS5, uploads ROMs via built-in C FTP server.
+pNES5 legacy launcher
+Sends nes.lua to PS5, uploads ROMs via the built-in FTP server.
 
   python nes_launcher.py <PS5_IP>
   python nes_launcher.py <PS5_IP> --roms-dir D:\\NES
   python nes_launcher.py <PS5_IP> --skip-upload
 
-Place .nes files in a 'roms' folder next to this script
+Prefer: python pnes5.py run <PS5_IP>
+Place .nes files in a 'roms' folder next to this script.
 """
 
 import socket, os, time, argparse
@@ -151,7 +152,7 @@ def upload_roms(host, roms, port=FTP_PORT):
 
 
 def main():
-    p = argparse.ArgumentParser(description='EgyDevTeam NES Launcher')
+    p = argparse.ArgumentParser(description='pNES5 legacy launcher')
     p.add_argument('ps5_ip', help='PS5 IP address')
     p.add_argument('--roms-dir', default=None)
     p.add_argument('--launcher', default=None, help='Lua launcher (default: nes.lua)')
@@ -166,7 +167,7 @@ def main():
     launcher = args.launcher or os.path.join(base, 'nes.lua')
     extensions = {e if e.startswith('.') else '.' + e for e in args.ext}
 
-    print(f"EgyDevTeam NES Launcher")
+    print(f"pNES5 launcher")
     print(f"  PS5: {args.ps5_ip}  ROMs: {roms_dir}")
     print()
 

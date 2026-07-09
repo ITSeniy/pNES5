@@ -724,6 +724,33 @@ void draw_str_limit(u8 *scr, int x, int y, const char *s, int max_chars, u8 colo
     }
 }
 
+void draw_str_marquee(u8 *scr, int x, int y, const char *s, int max_chars, u8 color, int frame) {
+    int len = str_len(s);
+    if (len <= max_chars || max_chars <= 0) {
+        draw_str_limit(scr, x, y, s, max_chars, color);
+        return;
+    }
+    /*
+     * Hold start 48f → scroll 1 char / 6f → hold end 48f → jump back.
+     * frame is host frames (mframe / total_frames).
+     */
+    int scrollable = len - max_chars;
+    int hold = 48;
+    int step = 6;
+    int scroll_frames = scrollable * step;
+    int period = hold + scroll_frames + hold;
+    int t = frame % period;
+    int off = 0;
+    if (t < hold)
+        off = 0;
+    else if (t < hold + scroll_frames)
+        off = (t - hold) / step;
+    else
+        off = scrollable;
+    if (off > scrollable) off = scrollable;
+    draw_str_limit(scr, x, y, s + off, max_chars, color);
+}
+
 void draw_centered(u8 *scr, int y, const char *s, u8 color) {
     int x = (NES_W - str_len(s) * 8) / 2;
     if (x < 0) x = 0;
@@ -774,8 +801,22 @@ int is_rom_file(const char *name) {
 }
 
 void extract_rom_name(const char *fn, char *out, int max) {
+    /*
+     * Copy basename, stripping only a trailing .nes / .rom (case-insensitive).
+     * Do not stop at the first '.' — "G.I. Joe (...).nes" must not become "G".
+     */
+    int len = str_len(fn);
+    int end = len;
+    if (len >= 4 && fn[len - 4] == '.') {
+        char b = fn[len - 3], c = fn[len - 2], d = fn[len - 1];
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (d >= 'A' && d <= 'Z') d = (char)(d + 32);
+        if ((b == 'n' && c == 'e' && d == 's') || (b == 'r' && c == 'o' && d == 'm'))
+            end = len - 4;
+    }
     int i = 0;
-    while (fn[i] && fn[i] != '.' && i < max - 1) {
+    while (i < end && i < max - 1) {
         out[i] = fn[i];
         i++;
     }

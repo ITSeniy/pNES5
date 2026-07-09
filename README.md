@@ -1,205 +1,127 @@
-# EmuC0re
+# pNES5
 
-Emulators running as native x86_64 shellcode on PS5 through the [LuaC0re](https://github.com/Gezine/Luac0re) JIT exploit.
+<p align="center">
+  <img src="pNES5.png" alt="pNES5" width="280">
+</p>
 
-PoC that full homebrew apps can be built and run from PS5 userland — no kernel exploit needed.  
-Works on all PS5 firmwares up to **13.00** (latest).
+NES emulator for PS5 as native x86_64 shellcode, running through [LuaC0re](https://github.com/Gezine/Luac0re) (no kernel exploit). Tested up to firmware **13.00**.
 
-## NES Emulator
+Forked from [EmuC0re](https://github.com/egycnq/EmuC0re) (EgyDevTeam / egycnq). Same LuaC0re shellcode approach; this repo focuses on a single NES host with tighter APU/PPU behavior, DualSense controls, and an in-game settings menu.
 
-First emulator in the project
+## Features
 
-- Full 6502 CPU (all 256 opcodes including illegals)
-- PPU with scrolling, sprites, sprite 0 hit
-- APU with 48kHz output
-- DualSense native pad support
-- Built-in FTP server for ROM upload
-- ROM picker menu + settings (scale, turbo, states)
-- Save states
-- NTSC/PAL
+- Full 6502 (including illegals)
+- PPU: scrolling, sprites, sprite 0
+- APU at 48 kHz (vsync-friendly buffering)
+- DualSense (native)
+- FTP ROM upload, library picker, save states
+- Settings: pixel-perfect / stretch / 2×–4× scale, turbo rate, reset
 
-### Supported Mappers
+## Mappers
 
-Mapper logic lives in `src/mapper.c` (init / PRG / CHR / IRQ hooks). The CPU/PPU bus in `src/bus.c` only dispatches.
+Logic is in `src/mapper.c`. The bus only dispatches.
 
-| #   | Name      | Notes |
-| --- | --------- | ----- |
-| 0   | NROM      | |
-| 1   | MMC1      | Consecutive-write filter, PRG-RAM disable |
-| 2   | UxROM     | |
-| 3   | CNROM     | |
-| 4   | MMC3      | A12 + scanline IRQ, WRAM protect, four-screen |
-| 7   | AxROM     | |
-| 9   | MMC2      | |
-| 10  | MMC4      | |
-| 11  | Color Dreams | |
-| 13  | CPROM     | 4KB CHR-RAM switch at `$1000` |
-| 34  | BNROM / NINA-001 | `$8000` BNROM + `$7FFD–7FFF` NINA |
-| 66  | GxROM     | |
-| 69  | FME-7     | Correct PRG slots, `$6000` ROM/RAM, CPU IRQ |
-| 70  | Bandai 74161 | |
-| 71  | Camerica  | |
-| 78  | Irem/Holy Diver | |
-| 79  | NINA-03/06 | AVE multicarts / unlicensed |
-| 87  | J87       | |
-| 93  | Sunsoft-2 | |
-| 94  | UxROM V   | |
-| 113 | NINA-03/06 | + mirroring control |
+| # | Name | Notes |
+| --- | --- | --- |
+| 0 | NROM | |
+| 1 | MMC1 | Consecutive-write filter, PRG-RAM disable |
+| 2 | UxROM | |
+| 3 | CNROM | |
+| 4 | MMC3 | A12 + scanline IRQ, WRAM protect, four-screen |
+| 7 | AxROM | |
+| 9 | MMC2 | |
+| 10 | MMC4 | |
+| 11 | Color Dreams | |
+| 13 | CPROM | 4KB CHR-RAM at `$1000` |
+| 34 | BNROM / NINA-001 | `$8000` BNROM + `$7FFD–7FFF` NINA |
+| 66 | GxROM | |
+| 69 | FME-7 | PRG slots, `$6000` ROM/RAM, CPU IRQ |
+| 70 | Bandai 74161 | |
+| 71 | Camerica | |
+| 78 | Irem / Holy Diver | |
+| 79 | NINA-03/06 | |
+| 87 | J87 | |
+| 93 | Sunsoft-2 | |
+| 94 | UxROM V | |
+| 113 | NINA-03/06 | + mirroring |
 | 140 | Jaleco JF-11 | |
 | 152 | Bandai 74161 | |
 | 180 | Inv UxROM | |
-| 185 | CNROM CP  | CHR disable / open bus |
-| 206 | DxROM     | |
+| 185 | CNROM CP | CHR disable / open bus |
+| 206 | DxROM | |
 
-CHR banking applies to both CHR-ROM and CHR-RAM. Games on unsupported mappers won't run.
-
-**Known limits:** MMC3 scanline IRQ timing is approximate (not PPU-dot accurate); blargg `4-scanline_timing` fails. MMC6-only WRAM tests are not fully covered.
+Unsupported mappers will not run. MMC3 scanline IRQ is approximate (blargg `4-scanline_timing` fails). MMC6-only WRAM tests are incomplete.
 
 ## Requirements
 
-- PS5 console (any firmware, tested up to 13.00)
-- [LuaC0re](https://github.com/Gezine/Luac0re) set up and working
-- _Star Wars Racer Revenge_ — US (CUSA03474) or EU (CUSA03492)  
-  If you're on latest FW you can grab the digital version from the PS Store
-- Python 3 on your PC
-- PC and PS5 on the same network
+- PS5 (tested through 13.00)
+- [LuaC0re](https://github.com/Gezine/Luac0re)
+- *Star Wars Racer Revenge* — US `CUSA03474` or EU `CUSA03492`
+- Python 3 on the PC, same LAN as the console
 
-## Building
+## Build & launch
 
-```
+```bash
 make clean && make
-make payload          # embed nes_emu.bin hex into nes.lua (sc=)
+make payload          # embed nes_emu.bin into nes.lua (sc=)
 ```
 
-Or one shot via the CLI:
+Or:
 
-```
-python emuc0re.py build
-python emuc0re.py build --clean
-```
-
-## Launch (recommended)
-
-```
-# save defaults once
-python emuc0re.py config --ps5 192.168.1.50
-
-# build + send + upload roms/ + optional UDP log
-python emuc0re.py run --build --log
-python emuc0re.py 192.168.1.50 --build --log
-
-# upload only (emu already running)
-python emuc0re.py upload
-
-# UDP debug log only
-python emuc0re.py log
+```bash
+python pnes5.py config --ps5 192.168.1.50
+python pnes5.py run --build --log
+python pnes5.py upload
+python pnes5.py log
 ```
 
-`emuc0re.py` patches `PC_IP` in the payload on the fly (for UDP logs on port 9027), remembers the last PS5 IP in `.emuc0re.json`, and skips ROM uploads that are already on the console.
+`pnes5.py` patches `PC_IP` in the payload for UDP logs on port **9027**, stores settings in `.pnes5.json`, and skips ROM uploads that are already on the console.
 
 Legacy: `python nes_launcher.py <PS5_IP>` still works.
 
-## Host ROM Tests
+## Host tests (no PS5)
 
-The core can also be exercised from WSL/Linux without launching the PS5 payload.
-
-```
+```bash
 make test
 make romtest
-```
-
-Run blargg-style test ROMs:
-
-```
 ./tests/nes_romtest path/to/test.nes --frames 600 --expect-pass
-```
-
-Run a quick `nestest.nes` CPU smoke pass starting at `$C000`:
-
-```
 ./tests/nes_romtest path/to/nestest.nes --nestest --steps 8991
 ```
 
-For blargg ROMs the runner prints the standard `$6000` status and the message
-string at `$6004` when present.
-
 ## Usage
 
-### Setup
+Put `.nes` files in `roms/` next to the CLI; the launcher FTPs them after the payload starts (port **1337**). You can also drop ROMs into the savedata path and refresh the library with **L1**.
 
-Optional — listen for debug log on your PC:
-
-Edit `nes.lua` and set your PC's IP for debug logs:
-
-```lua
-local PC_IP = "192.168.1.121"
-```
-
-```
-nc -u -l -p 9027
-```
-
-### Launch
-
-```
-python nes_launcher.py <PS5_IP>
-```
-
-This sends the payload to the LuaC0re loader (port 9026), waits for the FTP server, uploads ROMs from the `roms/` folder, then starts the emulator.
-
-Options:
-
-```
---roms-dir PATH    ROM folder (default: ./roms)
---skip-upload      Launch without uploading ROMs
---launcher PATH    Custom lua file (default: ./nes.lua)
---ext .nes .rom    File extensions to scan
---ftp-wait SEC     FTP timeout (default: 10)
-```
-
-### ROMs
-
-**FTP upload :** put `.nes` files in a `roms/` folder next to the script, the launcher handles the rest.
-
-or
-
-**Manual:** place files directly in the savedata directory, they'll show up in the nes emu picker.
+Optional UDP log: set `PC_IP` in `nes.lua`, then `nc -u -l -p 9027` or `python pnes5.py log`.
 
 ### Controls
 
-ROM picker:
+**Library**
 
-- **D-Pad** — navigate
-- **Cross / Start** — launch
-- **L1** — refresh ROM list from disk (after FTP or manual copy)
-- **R1** — exit emulator
+| Input | Action |
+| --- | --- |
+| D-Pad | Navigate |
+| Cross / Start | Launch |
+| L1 | Rescan ROMs on disk |
+| R1 | Exit |
 
-In-game:
+**In-game**
 
 | DualSense | Action |
-| --------- | ------ |
-| Cross | NES **A** |
-| Circle | NES **B** |
-| Square | **Turbo A** |
-| Triangle | **Turbo B** |
+| --- | --- |
+| Cross | A |
+| Circle | B |
+| Square | Turbo A |
+| Triangle | Turbo B |
 | Create / Touch pad | Select |
 | Options | Start |
 | D-Pad | D-Pad |
-| L2 | Save state (edge — no repeat while held) |
-| R2 | Load state (edge) |
-| L1 | ROM library |
-| R1 | **Settings menu** |
+| L2 / R2 | Save / load state (edge) |
+| L1 | Library |
+| R1 | Settings |
 | L3 + R3 | Soft reset |
 
-### Settings menu (R1)
-
-- **Scale** — Pixel Perfect (default integer max fit), Stretch, 2× / 3× / 4×
-- **Turbo** rate — 30 / 20 / 15 / 10 Hz
-- Save / Load state, Reset game, ROM library, Exit
-
-Navigate with D-Pad; Cross confirms; Circle / R1 closes; Left/Right change values.
-
-Input is **native DualSense only**.
+**Settings (R1)** — scale (pixel perfect / stretch / 2×–4×), turbo rate, save/load, reset, library, exit. Cross confirms, Circle closes, Left/Right change values.
 
 ## TODO
 
@@ -208,18 +130,13 @@ Input is **native DualSense only**.
 
 ## Credits
 
-**EgyDevTeam**
-
-Special thanks to [Abkarino](https://github.com/AbkarinoMHM) — co-founder of EgyDevTeam.
-
-- [Gezine](https://github.com/Gezine/Luac0re) — LuaC0re framework and JIT exploit
-- [CTurt](https://github.com/CTurt) — [mast1c0re](https://cturt.github.io/mast1c0re.html) writeup
-- [McCaulay](https://github.com/McCaulay) — [mast1c0re](https://mccaulay.co.uk/mast1c0re-part-2-arbitrary-ps2-code-execution/) writeup and [Okage](https://github.com/McCaulay/mast1c0re) reference implementation
-- [ChampionLeake](https://github.com/ChampionLeake) — PS2 _Star Wars Racer Revenge_ exploit writeup on [psdevwiki](https://www.psdevwiki.com/ps2/Vulnerabilities)
-- [shahrilnet](https://github.com/shahrilnet/remote_lua_loader) & [null_ptr](https://github.com/n0llptr) — Code references from [remote_lua_loader](https://github.com/shahrilnet/remote_lua_loader)
-- [NESDev Wiki](https://www.nesdev.org/wiki/) & community — NES hardware documentation
-- [nondebug/dualsense](https://github.com/nondebug/dualsense) — DualSense HID docs
+- [EmuC0re](https://github.com/egycnq/EmuC0re) — EgyDevTeam / [egycnq](https://github.com/egycnq), with [Abkarino](https://github.com/AbkarinoMHM)
+- [Gezine](https://github.com/Gezine/Luac0re) — LuaC0re
+- [CTurt](https://github.com/CTurt), [McCaulay](https://github.com/McCaulay) — mast1c0re
+- [ChampionLeake](https://github.com/ChampionLeake) — Racer Revenge notes on [psdevwiki](https://www.psdevwiki.com/ps2/Vulnerabilities)
+- [shahrilnet](https://github.com/shahrilnet/remote_lua_loader), [null_ptr](https://github.com/n0llptr)
+- [NESDev](https://www.nesdev.org/wiki/), [nondebug/dualsense](https://github.com/nondebug/dualsense)
 
 ## Disclaimer
 
-For research and educational purposes only. Use at your own risk.
+Research / educational use only. Use at your own risk.

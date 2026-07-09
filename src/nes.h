@@ -19,7 +19,8 @@
 } while(0)
 
 #define MAX_ROMS 4096
-#define MAX_NAME 28
+/* Display title after stripping .nes/.rom (keep internal dots, e.g. G.I. Joe). */
+#define MAX_NAME 48
 
 struct rom_entry {
     char filename[48];
@@ -252,6 +253,8 @@ void apu_prime(struct NES *nes, int buffers);
 void draw_char(u8 *scr, int x, int y, char ch, u8 color);
 void draw_str(u8 *scr, int x, int y, const char *s, u8 color);
 void draw_str_limit(u8 *scr, int x, int y, const char *s, int max_chars, u8 color);
+/* Scroll long titles in a fixed-width field (pause at each end). */
+void draw_str_marquee(u8 *scr, int x, int y, const char *s, int max_chars, u8 color, int frame);
 void draw_centered(u8 *scr, int y, const char *s, u8 color);
 void draw_hline(u8 *scr, int y, int x1, int x2, u8 color);
 void draw_vline(u8 *scr, int x, int y1, int y2, u8 color);

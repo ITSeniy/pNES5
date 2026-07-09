@@ -304,10 +304,7 @@ static void cmd_stor(struct ftp_ctx *f, const char *arg) {
         int k = 0;
         while (fn[k] && k < 47) { r->filename[k] = fn[k]; k++; }
         r->filename[k] = 0;
-        k = 0;
-        for (int i = 0; fn[i] && fn[i] != '.' && k < MAX_NAME - 1; i++)
-            r->display[k++] = fn[i];
-        r->display[k] = 0;
+        extract_rom_name(fn, r->display, MAX_NAME);
         f->rom_count++;
     }
 

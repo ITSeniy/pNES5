@@ -70,7 +70,7 @@ static void draw_menu_shell(u8 *scr, const char *title) {
     draw_box(scr, 4, 4, NES_W - 8, NES_H - 8, COL_PANEL_2);
     draw_hline(scr, 35, 8, NES_W - 8, COL_LINE);
     draw_hline(scr, 204, 8, NES_W - 8, COL_LINE);
-    draw_centered(scr, 8, "EMUC0RE NES", COL_BRAND);
+    draw_centered(scr, 8, "PNES5", COL_BRAND);
     draw_centered(scr, 21, title, COL_HEAD);
 }
 
@@ -585,6 +585,37 @@ static int read_native_pad(void *G, void *pad_read, s32 pad_h, u8 *pbuf,
     return 1;
 }
 
+/*
+ * Sample pad with sticky edge state.
+ *
+ * On a failed scePadRead we must NOT zero *prev — that re-arms rising edges
+ * while the physical button is still held (classic bug: open Settings on R1,
+ * a later failed read clears prev, next good frame looks like a new R1 press
+ * and immediately closes the menu). On failure: no edges, hold last levels.
+ */
+static void pad_sample(void *G, void *pad_read, s32 pad_h, u8 *pbuf,
+                       u8 *nes_lvl, u8 *meta_lvl, u8 *turbo_lvl,
+                       u8 *nes_prev, u8 *meta_prev,
+                       u8 *nes_edge, u8 *meta_edge) {
+    u8 n = 0, m = 0, t = 0;
+    s32 ok = read_native_pad(G, pad_read, pad_h, pbuf, &n, &m, &t);
+    if (ok >= 0) {
+        *nes_edge = (u8)(n & ~*nes_prev);
+        *meta_edge = (u8)(m & ~*meta_prev);
+        *nes_prev = n;
+        *meta_prev = m;
+        *nes_lvl = n;
+        *meta_lvl = m;
+        *turbo_lvl = t;
+    } else {
+        *nes_edge = 0;
+        *meta_edge = 0;
+        *nes_lvl = *nes_prev;
+        *meta_lvl = *meta_prev;
+        /* turbo has no edge tracking; leave caller's last *turbo_lvl. */
+    }
+}
+
 static void soft_reset_nes(struct NES *nes) {
     nes->a = 0;
     nes->x = 0;
@@ -759,7 +790,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     nes->audio_handle = audio_h;
     nes->noise.shift_reg = 1;
 
-    udp_log(G, sendto, log_fd, log_sa, "EgyDevTeam NES EMU V0.4 by egycnq\n");
+    udp_log(G, sendto, log_fd, log_sa, "pNES5\n");
     udp_log(G, sendto, log_fd, log_sa, pad_h >= 0 ? "Native pad OK\n" : "Native pad N/A\n");
 
     struct rom_entry *roms = (struct rom_entry *)NC(G, mmap, 0,
@@ -770,7 +801,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if ((s64)roms != -1) {
         /* Show FTP waiting screen */
         u8 *scr = nes->screen;
-        draw_menu_shell(scr, "NES EMULATOR");
+        draw_menu_shell(scr, "NES");
         draw_box(scr, 28, 58, 200, 92, COL_LINE);
         draw_rect(scr, 30, 60, 196, 88, COL_PANEL);
         draw_centered(scr, 74, "ROM DROP READY", COL_SEL);
@@ -844,33 +875,42 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u8 prev_scale_mode = 0xFF;
 
     for (;;) {
-        int selected = 0;
+        int selected = -1; /* -1 until the user explicitly picks a ROM */
         int cursor = 0, scroll = 0, mframe = 0, hold = 0;
         u8 prev_nes = 0;
         u8 meta_prev = 0;
         int refresh_msg = 0;
+        int lib_cooldown = 12; /* ignore Cross after Settings → ROM LIBRARY */
+
+        /*
+         * Seed edge state from currently held buttons. Otherwise a held Cross
+         * from confirming "ROM LIBRARY" looks like a fresh press and auto-launches
+         * cursor 0 (first ROM in the list).
+         */
+        {
+            u8 n = 0, m = 0, t = 0;
+            if (read_native_pad(G, pad_read, pad_h, pad_buf, &n, &m, &t) >= 0) {
+                prev_nes = n;
+                meta_prev = m;
+            }
+        }
 
         /* Library browser (also when empty — L1 rescans after new uploads). */
         for (;;) {
             u8 nes_btn = 0, meta_lvl = 0, turbo = 0;
-            s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf, &nes_btn, &meta_lvl, &turbo);
-            if (nb < 0) {
-                nes_btn = 0;
-                meta_lvl = 0;
-                turbo = 0;
+            u8 pressed = 0, meta_edge = 0;
+            pad_sample(G, pad_read, pad_h, pad_buf,
+                       &nes_btn, &meta_lvl, &turbo,
+                       &prev_nes, &meta_prev, &pressed, &meta_edge);
+            if (lib_cooldown > 0) {
+                lib_cooldown--;
+                pressed = 0;
+                /* Keep meta_edge for L1 refresh / R1 exit. */
             }
 
-            /*
-             * Meta is edge-filtered: held L1/L2/R1/R2 fire once only
-             * (same class of bug as the old trigger clobber).
-             */
-            u8 meta_edge = (u8)(meta_lvl & ~meta_prev);
-            meta_prev = meta_lvl;
-
-            /* Library: R1 exits (in-game R1 opens Settings — also edge). */
+            /* Library: R1 exits (in-game R1 opens Settings). */
             if (meta_edge & (META_EXIT | META_SETTINGS)) goto done;
 
-            u8 pressed = (u8)(nes_btn & ~prev_nes);
             int do_refresh = 0;
             if ((s64)roms != -1) {
                 if (meta_edge & META_LIBRARY) do_refresh = 1;
@@ -924,16 +964,14 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                     if (cursor < scroll) scroll = cursor;
                     if (cursor >= scroll + visible) scroll = cursor - visible + 1;
                 }
-                /* Cross (A) or Start → play */
-                if ((pressed & 0x01) || (pressed & 0x08)) {
+                /* Cross (A) or Start → play (only after entry cooldown). */
+                if (lib_cooldown == 0 && ((pressed & 0x01) || (pressed & 0x08))) {
                     selected = cursor;
-                    prev_nes = nes_btn;
                     break;
                 }
             } else {
                 hold = 0;
             }
-            prev_nes = nes_btn;
             (void)turbo;
 
             u8 *scr = nes->screen;
@@ -975,14 +1013,20 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                     int nx = 34;
                     nx = draw_uint(scr, nx, iy, num, nc);
                     draw_char(scr, nx, iy, '.', nc);
-                    draw_str_limit(scr, 70, iy, roms[idx].display, 20, sel ? COL_SEL : COL_NORM);
+                    /* Selected row marquee; others static truncate. */
+                    if (sel)
+                        draw_str_marquee(scr, 70, iy, roms[idx].display, 20,
+                                         COL_SEL, mframe);
+                    else
+                        draw_str_limit(scr, 70, iy, roms[idx].display, 20, COL_NORM);
                 }
 
                 if (refresh_msg > 0) {
                     draw_centered(scr, 212, "LIST REFRESHED", COL_SEL);
                     refresh_msg--;
                 } else {
-                    draw_str_limit(scr, 16, 212, roms[cursor].display, 28, COL_HEAD);
+                    draw_str_marquee(scr, 16, 212, roms[cursor].display, 28,
+                                     COL_HEAD, mframe);
                 }
                 draw_str(scr, 12, 224, "X PLAY", COL_SEL);
                 draw_str(scr, 76, 224, "L1 REFRESH", COL_NORM);
@@ -1014,6 +1058,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             total_frames++;
         }
 
+        /* No selection (e.g. only refresh) — stay in library. */
         if (rom_count <= 0 || selected < 0 || selected >= rom_count)
             continue;
 
@@ -1167,29 +1212,26 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int in_settings = 0;
         int set_cursor = 0;
         int set_hold = 0;
+        int set_cooldown = 0; /* frames to ignore confirm/back after open */
         u8 meta_prev_g = 0;
         u8 prev_nes_g = 0;
+        u8 turbo_hold = 0;
         /* Settings rows: 0 scale, 1 turbo, 2 save, 3 load, 4 reset, 5 library, 6 exit */
         enum { SET_N = 7 };
 
         for (;;) {
-            u8 nes_btn = 0, meta_lvl = 0, turbo = 0;
-            s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf, &nes_btn, &meta_lvl, &turbo);
-            if (nb < 0) {
-                nes_btn = 0;
-                meta_lvl = 0;
-                turbo = 0;
-            }
-
-            /* Rising edge only — held R1/L2/R2 do not re-fire every frame. */
-            u8 meta_edge = (u8)(meta_lvl & ~meta_prev_g);
-            meta_prev_g = meta_lvl;
-
-            u8 pressed = (u8)(nes_btn & ~prev_nes_g);
-            prev_nes_g = nes_btn;
+            u8 nes_btn = 0, meta_lvl = 0, turbo = turbo_hold;
+            u8 pressed = 0, meta_edge = 0;
+            pad_sample(G, pad_read, pad_h, pad_buf,
+                       &nes_btn, &meta_lvl, &turbo,
+                       &prev_nes_g, &meta_prev_g, &pressed, &meta_edge);
+            turbo_hold = turbo;
 
             /* —— Settings menu (paused) —— */
             if (in_settings) {
+                if (set_cooldown > 0)
+                    set_cooldown--;
+
                 int move = 0;
                 if (nes_btn & 0x10) {
                     set_hold++;
@@ -1207,15 +1249,18 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 }
 
                 int act = 0, adj = 0;
-                if (pressed & 0x01) act = 1;           /* Cross = confirm */
-                if (pressed & 0x02) {                   /* Circle = back */
-                    in_settings = 0;
-                    act = 0;
+                /* Ignore face/meta close while cooldown: residual Cross after
+                 * "Reset Game" or a bounced R1 must not instantly dismiss. */
+                if (set_cooldown == 0) {
+                    if (pressed & 0x01) act = 1;           /* Cross = confirm */
+                    if (pressed & 0x02) {                   /* Circle = back */
+                        in_settings = 0;
+                        act = 0;
+                    }
+                    if (pressed & 0x40) adj = -1;           /* Left */
+                    if (pressed & 0x80) adj = 1;            /* Right */
+                    /* R1 does NOT toggle-close (edge re-fire risk). Circle only. */
                 }
-                if (pressed & 0x40) adj = -1;           /* Left */
-                if (pressed & 0x80) adj = 1;            /* Right */
-                /* R1 rising edge closes (hold does nothing — no open/close spam). */
-                if (meta_edge & META_SETTINGS) in_settings = 0;
 
                 if (act || adj) {
                     if (set_cursor == 0) {
@@ -1300,7 +1345,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                         if (i == 1)
                             draw_str_limit(scr, 120, iy, turbo_rate_name(turbo_rate), 10, col);
                     }
-                    draw_centered(scr, 180, "X OK  O BACK  L/R VALUE", COL_DIM);
+                    draw_centered(scr, 180, "X OK  O CLOSE  L/R VALUE", COL_DIM);
                 }
 
                 if (prev_scale_mode != scale_mode) {
@@ -1335,6 +1380,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 in_settings = 1;
                 set_cursor = 0;
                 set_hold = 0;
+                /* Wait out residual A/B from menu actions + R1 release. */
+                set_cooldown = 12;
                 continue;
             }
             if (meta_edge & META_RESET) {

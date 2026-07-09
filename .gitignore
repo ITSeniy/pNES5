@@ -8,6 +8,8 @@
 __pycache__/
 *.pyc
 .codex_tmp/
+.pnes5.json
+.emuc0re.json
 mmc3_scanline.ppm
 nes_emu.bin
 nes_emu.elf
@@ -43,6 +45,12 @@ tests/dmc_sync_loop
 tests/dmc_tickratio
 tests/dmc_trace
 tests/dmc_force_halt
+tests/cpu_behavior2_smoke
+tests/vblank_ac_run
 
 # Large external test ROM pack (not part of the emulator core)
 nes-test-roms-master/
+
+# Local ROM dumps (keep folder, ignore contents)
+roms/*
+!roms/.gitkeep

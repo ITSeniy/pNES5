@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-EmuC0re — one-stop CLI for build, payload, launch, ROM upload, and UDP logs.
+pNES5 — one-stop CLI for build, payload, launch, ROM upload, and UDP logs.
 
 Examples:
-  python emuc0re.py                  # interactive / uses saved config
-  python emuc0re.py 192.168.1.50     # launch to PS5
-  python emuc0re.py build            # make + patch nes.lua sc=
-  python emuc0re.py run 192.168.1.50
-  python emuc0re.py run --build --log
-  python emuc0re.py upload 192.168.1.50
-  python emuc0re.py log              # listen for UDP debug on :9027
-  python emuc0re.py config --ps5 192.168.1.50 --pc 192.168.1.10
+  python pnes5.py                  # interactive / uses saved config
+  python pnes5.py 192.168.1.50     # launch to PS5
+  python pnes5.py build            # make + patch nes.lua sc=
+  python pnes5.py run 192.168.1.50
+  python pnes5.py run --build --log
+  python pnes5.py upload 192.168.1.50
+  python pnes5.py log              # listen for UDP debug on :9027
+  python pnes5.py config --ps5 192.168.1.50 --pc 192.168.1.10
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from ftplib import FTP
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / ".emuc0re.json"
+CONFIG_PATH = ROOT / ".pnes5.json"
 LUA_PATH = ROOT / "nes.lua"
 BIN_PATH = ROOT / "nes_emu.bin"
 ROMS_DIR = ROOT / "roms"
@@ -44,11 +44,13 @@ JIT_SIZE = 0x10000
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    if CONFIG_PATH.is_file():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    # Prefer .pnes5.json; fall back to legacy .emuc0re.json if present.
+    for path in (CONFIG_PATH, ROOT / ".emuc0re.json"):
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
     return {}
 
 
@@ -97,7 +99,7 @@ def run_make(target: str = "") -> int:
         wsl = shutil.which("wsl")
         if wsl and (not make or sys.platform == "win32"):
             # Prefer WSL gcc/toolchain for freestanding x86_64 payload
-            if not make or os.environ.get("EMUC0RE_USE_WSL", "1") != "0":
+            if not make or os.environ.get("PNES5_USE_WSL", "1") != "0":
                 use_wsl = bool(wsl)
 
     if use_wsl:
@@ -349,8 +351,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config()
     ps5 = resolve_ps5(args, cfg)
     if not ps5:
-        print("  [FAIL] PS5 IP required. Example: python emuc0re.py run 192.168.1.50", file=sys.stderr)
-        print("         or: python emuc0re.py config --ps5 192.168.1.50", file=sys.stderr)
+        print("  [FAIL] PS5 IP required. Example: python pnes5.py run 192.168.1.50", file=sys.stderr)
+        print("         or: python pnes5.py config --ps5 192.168.1.50", file=sys.stderr)
         return 2
 
     if getattr(args, "build", False):
@@ -369,7 +371,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         roms_dir = ROOT / roms_dir
     extensions = {e if e.startswith(".") else f".{e}" for e in (args.ext or [".nes"])}
 
-    print(f"EmuC0re → {ps5}")
+    print(f"pNES5 → {ps5}")
     if pc_ip:
         print(f"  PC log IP: {pc_ip}:{LOG_PORT}")
     print(f"  ROMs: {roms_dir}")
@@ -506,7 +508,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config()
-    print("EmuC0re status")
+    print("pNES5 status")
     print(f"  root:     {ROOT}")
     print(f"  bin:      {BIN_PATH} {'OK' if BIN_PATH.is_file() else 'MISSING'}", end="")
     if BIN_PATH.is_file():
@@ -537,14 +539,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="emuc0re",
-        description="Build, embed, and launch EmuC0re NES on PS5",
+        prog="pnes5",
+        description="Build, embed, and launch pNES5 NES on PS5",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = p.add_subparsers(dest="cmd")
 
-    # bare: python emuc0re.py [IP]  → run
+    # bare: python pnes5.py [IP]  → run
     p.add_argument("ps5_positional", nargs="?", help="PS5 IP (shortcut for 'run')")
     p.add_argument("--build", action="store_true", help="build+embed before launch")
     p.add_argument("--clean", action="store_true", help="make clean before build")
