@@ -117,7 +117,18 @@ void render_scanline(struct NES *nes, int y) {
     u8 bg_opaque[NES_W];
     for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
 
-    if (nes->ppu_mask & 0x08) {
+    /*
+     * Hardware keeps BG shift registers filling whenever *either* BG or
+     * sprites are enabled, and sprite evaluation runs whenever either is
+     * on (AccuracyCoin Rendering Flag Behavior). Only the show bits control
+     * what is actually painted.
+     */
+    int any_render = (nes->ppu_mask & 0x18) != 0;
+    int show_bg = (nes->ppu_mask & 0x08) != 0;
+    int show_spr = (nes->ppu_mask & 0x10) != 0;
+    nes->sp0_overlap = 0;
+
+    if (any_render) {
         u16 v = nes->vram_addr;
         u16 pat = (nes->ppu_ctrl & 0x10) ? 0x1000 : 0;
 
@@ -139,8 +150,9 @@ void render_scanline(struct NES *nes, int y) {
                 if (sx < 0 || sx >= NES_W) continue;
                 u8 color = ((hi >> (7-px)) & 1) << 1 | ((lo >> (7-px)) & 1);
                 if (color) {
-                    line[sx] = nes->palette[pal_idx * 4 + color];
                     bg_opaque[sx] = 1;
+                    if (show_bg)
+                        line[sx] = nes->palette[pal_idx * 4 + color];
                 }
             }
 
@@ -149,7 +161,7 @@ void render_scanline(struct NES *nes, int y) {
         }
     }
 
-    if (nes->ppu_mask & 0x10) {
+    if (any_render) {
         int sph = (nes->ppu_ctrl & 0x20) ? 16 : 8;
         u16 spr_pat = (nes->ppu_ctrl & 0x08) ? 0x1000 : 0;
         int cnt = 0;
@@ -205,9 +217,13 @@ void render_scanline(struct NES *nes, int y) {
                 int dx = sx + px;
                 if (dx >= NES_W) continue;
                 if (has_sp0 && i == 0 && bg_opaque[dx] && dx < 255
-                    && (nes->ppu_mask & 0x08)
-                    && !(sp0_left_clip && dx < 8))
-                    nes->ppu_status |= 0x40;
+                    && !(sp0_left_clip && dx < 8)) {
+                    nes->sp0_overlap = 1;
+                    /* Both show bits required for the hit; may rise mid-line. */
+                    if (show_bg && show_spr)
+                        nes->ppu_status |= 0x40;
+                }
+                if (!show_spr) continue;
                 if (spr_clip && dx < 8) continue;
                 if ((attr & 0x20) && bg_opaque[dx]) continue;
                 line[dx] = nes->palette[spal * 4 + c];
@@ -244,6 +260,14 @@ void run_frame(struct NES *nes) {
         mapper_scanline_clock(nes);
 
         step_cpu_apu_until(nes, target, 0, 0);
+
+        /*
+         * Mid-scanline $2001 can enable the missing BG/sprite bit after the
+         * line was drawn; if overlap was already in the shift regs, set sp0.
+         */
+        if (nes->sp0_overlap && (nes->ppu_mask & 0x18) == 0x18)
+            nes->ppu_status |= 0x40;
+        nes->sp0_overlap = 0;
     }
 
     for (int y = 240; y < total_sl; y++) {

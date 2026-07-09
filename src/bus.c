@@ -111,13 +111,25 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
             break;
         }
         case 7: {
-            result = nes->read_buf;
+            /*
+             * $2007: non-palette reads return the previous fill (1-byte buffer).
+             * Palette ($3F00–$3FFF) returns immediately; the buffer is filled from
+             * the nametable under that address (bit 12 clear → $2Fxx), AccuracyCoin
+             * PPU Read Buffer test 7 / Palette RAM Quirks prerequisite.
+             */
             {
                 u16 a = nes->vram_addr & 0x3FFF;
                 mapper_notify_a12(nes, a);
-                nes->read_buf = ppu_read(nes, a);
-                if (a >= 0x3F00)
-                    result = (nes->read_buf & 0x3F) | (nes->ppu_open_bus & 0xC0);
+                if (a >= 0x3F00) {
+                    u8 pal = ppu_read(nes, a);
+                    if (nes->ppu_mask & 0x01)
+                        pal &= 0x30; /* greyscale: force lower 4 bits clear */
+                    result = (u8)((pal & 0x3F) | (nes->ppu_open_bus & 0xC0));
+                    nes->read_buf = ppu_read(nes, (u16)(a & 0x2FFF));
+                } else {
+                    result = nes->read_buf;
+                    nes->read_buf = ppu_read(nes, a);
+                }
                 ppu_bus_set(nes, result);
                 vram_step(nes);
                 mapper_notify_a12(nes, nes->vram_addr);
@@ -249,7 +261,9 @@ void ppu_write(struct NES *nes, u16 addr, u8 val) {
     } else {
         u8 idx = addr & 0x1F;
         if ((idx & 0x13) == 0x10) idx &= 0x0F;
-        nes->palette[idx] = val;
+        /* Palette entries are 6-bit; greyscale does not alter write path
+         * (AccuracyCoin Palette RAM Quirks tests 5–7: mask on read only). */
+        nes->palette[idx] = val & 0x3F;
     }
 }
 
