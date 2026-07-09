@@ -5,6 +5,43 @@ local sc = "41 57 48 8D 87 A9 1A 03 00 48 8D 0D BF D7 00 00 41 56 41 55 41 54 55
 init_dlsym()
 sceMsgDialogTerminate() 
 
+--[[
+  PS5 8.00+ create_socket() path (LuaC0re):
+    jit_syscall.socket()  →  SCM_RIGHTS transfer to main  →  returns main FD
+  The original JIT-side FD is never closed.  Main-process close() then only drops
+  one reference, so listen ports (FTP 1337/1338, web 9030) stay bound and the
+  next inject cannot re-bind — "FTP not ready" after exit + relaunch.
+  Close the JIT FD after a successful (or failed) transfer.
+]]
+do
+    local _create_socket = create_socket
+    function create_socket(domain, socktype, protocol)
+        domain   = domain   or AF_INET
+        socktype = socktype or SOCK_STREAM
+        protocol = protocol or 0
+        local fw = tonumber(FW_VERSION) or 0
+        -- Same routing as LuaC0re: only PS5 >= 8.00 AF_INET/etc use the JIT path.
+        if PLATFORM == "PS4" or domain == AF_UNIX
+           or (PLATFORM == "PS5" and fw < 8.00)
+           or not jit_syscall or not jit_syscall.socket or not jit_send_recv_fd then
+            return _create_socket(domain, socktype, protocol)
+        end
+        local jit_fd = jit_syscall.socket(domain, socktype, protocol)
+        if not jit_fd or jit_fd < 0 then
+            return -1
+        end
+        local fd = jit_send_recv_fd(jit_fd, NEW_JIT_SOCK, NEW_MAIN_SOCK)
+        -- Drop JIT reference so the port can be unbound when main closes its FD.
+        if jit_syscall.close then
+            pcall(function() jit_syscall.close(jit_fd) end)
+        end
+        if not fd or fd < 0 then
+            return -1
+        end
+        return fd
+    end
+end
+
 local PC_IP    = "192.168.1.114"
 local LOG_PORT = 9027
 local WEB_PORT = 9030
@@ -31,6 +68,7 @@ local function ulog(m)
     if log_sock >= 0 then syscall.sendto(log_sock, m.."\n", #m+1, 0, log_sa, 16) end
 end
 ulog("=== EgyDevTeam NES EMU V0.4 by egycnq")
+ulog("socket fix: close JIT fd after SCM_RIGHTS (rebind after exit)")
 
 if not sceKernelLoadStartModule then
     sceKernelLoadStartModule = func_wrap(dlsym(LIBKERNEL_HANDLE, "sceKernelLoadStartModule"))
@@ -1265,29 +1303,46 @@ ulog("HTML: " .. html_len .. " bytes")
 
 
 
+-- Brief sleep between bind retries (nanosleep if available).
+local function brief_sleep_ms(ms)
+    ms = ms or 200
+    if syscall.nanosleep then
+        local ts = malloc(16)
+        write64(ts, 0)                          -- tv_sec
+        write64(ts + 8, ms * 1000000)           -- tv_nsec
+        pcall(function() syscall.nanosleep(ts, 0) end)
+    end
+end
+
 -- FTP listen sockets (SO_REUSEADDR/PORT so a second inject can re-bind after cleanup)
 local function open_listen(port, name)
-    local fd = create_socket(AF_INET, 1, 0)
-    if fd < 0 then
-        ulog(name .. " socket failed")
-        return -1
-    end
     local en = malloc(4)
     write32(en, 1)
-    syscall.setsockopt(fd, 0xFFFF, 0x0004, en, 4) -- SO_REUSEADDR
-    pcall(function() syscall.setsockopt(fd, 0xFFFF, 0x0200, en, 4) end) -- SO_REUSEPORT
-    local ba = make_sockaddr_in(port)
-    local ret = syscall.bind(fd, ba, 16)
-    ulog(name .. " fd=" .. tostring(fd) .. " bind=" .. tostring(ret) .. " port=" .. tostring(port))
-    -- treat negative / large unsigned as error (port still busy from previous run)
-    local failed = (type(ret) == "number" and (ret < 0 or ret > 0x7fffffff))
-    if failed then
-        pcall(function() syscall.close(fd) end)
-        ulog(name .. " bind FAILED")
-        return -1
+    for attempt = 1, 6 do
+        local fd = create_socket(AF_INET, 1, 0)
+        if fd < 0 then
+            ulog(name .. " socket failed attempt=" .. tostring(attempt))
+            brief_sleep_ms(200)
+        else
+            syscall.setsockopt(fd, 0xFFFF, 0x0004, en, 4) -- SO_REUSEADDR
+            pcall(function() syscall.setsockopt(fd, 0xFFFF, 0x0200, en, 4) end) -- SO_REUSEPORT
+            local ba = make_sockaddr_in(port)
+            local ret = syscall.bind(fd, ba, 16)
+            ulog(name .. " fd=" .. tostring(fd) .. " bind=" .. tostring(ret)
+                 .. " port=" .. tostring(port) .. " try=" .. tostring(attempt))
+            -- treat negative / large unsigned as error (port still busy from previous run)
+            local failed = (type(ret) == "number" and (ret < 0 or ret > 0x7fffffff))
+            if not failed then
+                syscall.listen(fd, 128)
+                return fd
+            end
+            pcall(function() syscall.close(fd) end)
+            ulog(name .. " bind FAILED try=" .. tostring(attempt))
+            brief_sleep_ms(250 * attempt)
+        end
     end
-    syscall.listen(fd, 128)
-    return fd
+    ulog(name .. " bind gave up")
+    return -1
 end
 
 local ftp_srv = open_listen(1337, "ftp_srv")
@@ -1350,10 +1405,11 @@ ulog("Done! frames=" .. frames)
 send_notification("NES done " .. frames .. "f")
 
 -- Always release Lua-owned sockets so the next inject can bind 1337/1338/9030.
+-- (With the create_socket JIT-FD fix above, close() fully frees the port.)
 local function safe_close(fd, name)
     if fd and type(fd) == "number" and fd >= 0 then
         local ok, err = pcall(function()
-            if syscall.shutdown then pcall(function() syscall.shutdown(fd, 2) end) end
+            -- Prefer plain close; do not shutdown() listen sockets (can leave odd state).
             syscall.close(fd)
         end)
         ulog((name or "fd") .. " close " .. tostring(fd) .. (ok and " ok" or (" fail:" .. tostring(err))))
