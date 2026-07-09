@@ -285,15 +285,27 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             && start < nmi_cycle && start + hint >= nmi_cycle) {
             int ic = nmi_cycle - start;
             int nmi_on = (nes->ppu_ctrl & 0x80) != 0;
+            int ph = vbl_phase % 3;
             if (ic >= hint) {
                 /*
-                 * VBL at instruction end.
+                 * Instruction end.
                  * NMI off: pre-set (Beginning/End).
-                 * NMI on + phase: mid-arm → $2002 can yield $01 (V no N).
-                 * NMI on + other: set after → next instr takes NMI ($03).
+                 * NMI on + phase+2: mid-arm → $01 (V no N on $2002).
+                 * NMI on + $2002 load: NMI before load → $03 (not set-after $02).
+                 * NMI on + other op: set after step.
                  */
-                int ph = vbl_phase % 3;
-                if (!nmi_on || ph == VBL_RACE_PHASE) {
+                if (!nmi_on) {
+                    begin_vblank(nes, 1, ic > 0 ? ic : 1);
+                    *nmi_done = 1;
+                } else if (is_ldx_2002) {
+                    if (ph == ((VBL_RACE_PHASE + 2) % 3)) {
+                        begin_vblank(nes, 1, ic > 0 ? ic : 1);
+                        *nmi_done = 1;
+                    } else {
+                        begin_vblank(nes, 0, 0);
+                        *nmi_done = 1;
+                    }
+                } else if (ph == VBL_RACE_PHASE) {
                     begin_vblank(nes, 1, ic > 0 ? ic : 1);
                     *nmi_done = 1;
                 }
@@ -327,7 +339,10 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             begin_vblank_suppressed(nes);
             *nmi_done = 1;
         }
-        /* VBL one CPU into the LDX→LDY gap: same 1-PPU-wide suppress window. */
+        /*
+         * VBL one CPU after $2002 load ends (Beginning LDX→LDY gap, and
+         * Suppression's post-LDA window). Phase-gated to 1 PPU.
+         */
         if (was_ldx_2002 && phase_race && nmi_done && !*nmi_done
             && nmi_cycle >= 0 && nmi_cycle == ldx_end + 1) {
             begin_vblank_suppressed(nes);
