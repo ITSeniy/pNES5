@@ -112,9 +112,11 @@ static void step_cpu_apu_until(struct NES *nes, int target, int nmi_cycle, int *
     }
 }
 
-void render_scanline(struct NES *nes, int y) {
+int render_scanline(struct NES *nes, int y) {
     u8 *line = &nes->screen[y * NES_W];
-    u8 bg_opaque[NES_W];
+    /* File-static: freestanding PS payload stack is tight (_start alone ~1.4KB). */
+    static u8 bg_opaque[NES_W];
+    int sp0_overlap = 0;
     for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
 
     /*
@@ -126,7 +128,6 @@ void render_scanline(struct NES *nes, int y) {
     int any_render = (nes->ppu_mask & 0x18) != 0;
     int show_bg = (nes->ppu_mask & 0x08) != 0;
     int show_spr = (nes->ppu_mask & 0x10) != 0;
-    nes->sp0_overlap = 0;
 
     if (any_render) {
         u16 v = nes->vram_addr;
@@ -218,7 +219,7 @@ void render_scanline(struct NES *nes, int y) {
                 if (dx >= NES_W) continue;
                 if (has_sp0 && i == 0 && bg_opaque[dx] && dx < 255
                     && !(sp0_left_clip && dx < 8)) {
-                    nes->sp0_overlap = 1;
+                    sp0_overlap = 1;
                     /* Both show bits required for the hit; may rise mid-line. */
                     if (show_bg && show_spr)
                         nes->ppu_status |= 0x40;
@@ -233,6 +234,7 @@ void render_scanline(struct NES *nes, int y) {
 
     if (!(nes->ppu_mask & 0x02))
         for (int x = 0; x < 8; x++) line[x] = nes->palette[0];
+    return sp0_overlap;
 }
 
 void run_frame(struct NES *nes) {
@@ -248,7 +250,7 @@ void run_frame(struct NES *nes) {
     for (int y = 0; y < 240; y++) {
         if (nes->ppu_mask & 0x18) copy_scroll_x(nes);
 
-        render_scanline(nes, y);
+        int sp0_overlap = render_scanline(nes, y);
         if (nes->ppu_mask & 0x18) inc_scroll_y(nes);
 
         int irq_target = target + (260 * sl_num) / (341 * sl_den);
@@ -265,9 +267,8 @@ void run_frame(struct NES *nes) {
          * Mid-scanline $2001 can enable the missing BG/sprite bit after the
          * line was drawn; if overlap was already in the shift regs, set sp0.
          */
-        if (nes->sp0_overlap && (nes->ppu_mask & 0x18) == 0x18)
+        if (sp0_overlap && (nes->ppu_mask & 0x18) == 0x18)
             nes->ppu_status |= 0x40;
-        nes->sp0_overlap = 0;
     }
 
     for (int y = 240; y < total_sl; y++) {

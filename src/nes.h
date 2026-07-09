@@ -92,13 +92,6 @@ struct NES {
     u16 vram_addr, temp_addr;
     u8  fine_x, write_toggle, read_buf, ppu_open_bus;
     u8  ppu_open_bus_decay_low, ppu_open_bus_decay_high;
-    /*
-     * Opaque BG+sprite0 overlap this scanline (ignoring whether both $2001
-     * bits were on at render time). Committed after the scanline's CPU so a
-     * mid-line $2001 write can still set sprite-zero (AccuracyCoin Rendering
-     * Flag Behavior).
-     */
-    u8  sp0_overlap;
 
     u8  ram[0x800];
     u8  sram[0x2000];
@@ -216,8 +209,8 @@ void apu_on_cpu_cycle_begin(struct NES *nes);
 void cpu_step(struct NES *nes);
 u16  cpu_read16(struct NES *nes, u16 addr);
 
-/* ppu.c */
-void render_scanline(struct NES *nes, int y);
+/* ppu.c — returns 1 if opaque BG+sprite0 overlap on this scanline */
+int  render_scanline(struct NES *nes, int y);
 void run_frame(struct NES *nes);
 
 /* apu.c */
