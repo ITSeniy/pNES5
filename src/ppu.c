@@ -173,6 +173,39 @@ static int cpu_next_cycles_hint(struct NES *nes) {
     }
 }
 
+/* Peek absolute operand; 1 if this instr's memory operand is $2002 (mirrored). */
+static int abs_operand_is_ppu_status(struct NES *nes) {
+    u16 pc = nes->pc;
+    u8 op;
+    if (pc < 0x2000)
+        op = nes->ram[pc & 0x7FF];
+    else if (pc >= 0x8000)
+        op = mapper_prg_read(nes, pc);
+    else
+        return 0;
+    /* Common abs / abs,X / abs,Y reads used around VBL tests (LDA/LDX/LDY/BIT/…). */
+    switch (op) {
+    case 0x0D: case 0x2C: case 0x2D: case 0x4D: case 0x6D:
+    case 0xAD: case 0xAE: case 0xAC: case 0xBD: case 0xB9:
+    case 0xBC: case 0xBE: case 0xCD: case 0xDD: case 0xD9:
+    case 0xED: case 0xFD: case 0xF9:
+        break;
+    default:
+        return 0;
+    }
+    u8 lo, hi;
+    u16 a1 = (u16)(pc + 1), a2 = (u16)(pc + 2);
+    if (a1 < 0x2000) lo = nes->ram[a1 & 0x7FF];
+    else if (a1 >= 0x8000) lo = mapper_prg_read(nes, a1);
+    else return 0;
+    if (a2 < 0x2000) hi = nes->ram[a2 & 0x7FF];
+    else if (a2 >= 0x8000) hi = mapper_prg_read(nes, a2);
+    else return 0;
+    u16 addr = (u16)(lo | (hi << 8));
+    /* $2002 and mirrors $200A, $2012, … through $3FFA */
+    return (addr >= 0x2000 && addr < 0x4000 && (addr & 7) == 2);
+}
+
 static void begin_vblank(struct NES *nes, int during_cpu_step, int instr_cycle) {
     nes->ppu_status |= 0x80;
     nes->in_vblank = 1;
@@ -185,22 +218,79 @@ static void begin_vblank(struct NES *nes, int during_cpu_step, int instr_cycle) 
     }
 }
 
-static void step_cpu_apu_until(struct NES *nes, int target, int nmi_cycle, int *nmi_done) {
-    if (nmi_done && !*nmi_done && nes->cycles >= nmi_cycle) {
+/* VBlank period without status bit / NMI (same-cycle $2002 race). */
+static void begin_vblank_suppressed(struct NES *nes) {
+    nes->in_vblank = 1;
+    nes->ppu_status &= ~0x80;
+}
+
+static void end_vblank(struct NES *nes) {
+    /* Same instant as pre-render: clear VBlank + sprite0 + overflow. */
+    nes->ppu_status &= ~0xE0;
+    nes->in_vblank = 0;
+}
+
+/*
+ * Advance CPU/APU to `target`. Optional one-shot events:
+ *   nmi_cycle  — set VBlank/NMI (pass nmi_done non-NULL)
+ *   clr_cycle  — clear VBlank flags (pass clr_done non-NULL)
+ * Use cycle < 0 to disable an event.
+ *
+ * Same-cycle $2002 race (AccuracyCoin VBlank beginning A=4 / NMI Suppression):
+ * if VBL lands on the read cycle of an abs $2002 load, run the instruction
+ * first so the read sees 0, then enter vblank without setting bit 7 / NMI.
+ */
+static void step_cpu_apu_until(struct NES *nes, int target,
+                              int nmi_cycle, int *nmi_done,
+                              int clr_cycle, int *clr_done) {
+    if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
         begin_vblank(nes, 0, 0);
         *nmi_done = 1;
+    }
+    if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
+        end_vblank(nes);
+        *clr_done = 1;
     }
     while (nes->cycles < target) {
-        if (nmi_done && !*nmi_done && nes->cycles < nmi_cycle
-            && nes->cycles + cpu_next_cycles_hint(nes) >= nmi_cycle) {
-            begin_vblank(nes, 1, nmi_cycle - nes->cycles);
+        int hint = cpu_next_cycles_hint(nes);
+        int start = nes->cycles;
+        int race = 0;
+
+        if (nmi_done && !*nmi_done && nmi_cycle >= 0
+            && start < nmi_cycle && start + hint >= nmi_cycle) {
+            int ic = nmi_cycle - start;
+            /*
+             * Same-cycle $2002 race (AccuracyCoin VBlank beginning A=4,
+             * NMI Suppression): VBL on the read cycle → read sees 0 and the
+             * flag/NMI are suppressed for the frame.
+             */
+            if (abs_operand_is_ppu_status(nes) && hint > 0 && ic == hint - 1)
+                race = 1;
+            else {
+                begin_vblank(nes, 1, ic > 0 ? ic : 1);
+                *nmi_done = 1;
+            }
+        }
+        if (clr_done && !*clr_done && clr_cycle >= 0
+            && start < clr_cycle && start + hint >= clr_cycle) {
+            end_vblank(nes);
+            *clr_done = 1;
+        }
+
+        step_cpu_apu(nes);
+
+        if (race) {
+            begin_vblank_suppressed(nes);
             *nmi_done = 1;
         }
-        step_cpu_apu(nes);
     }
-    if (nmi_done && !*nmi_done && nes->cycles >= nmi_cycle) {
+    if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
         begin_vblank(nes, 0, 0);
         *nmi_done = 1;
+    }
+    if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
+        end_vblank(nes);
+        *clr_done = 1;
     }
 }
 
@@ -341,10 +431,15 @@ void run_frame(struct NES *nes) {
     nes->ppu_cur_scanline = -1;
     int target = 0, sl_acc = nes->frame_cycle_rem;
     int vblank_nmi_done = 0;
+    int vblank_clr_done = 0;
     int sl_num = nes->is_pal ? (341 * 5) : 341;
     int sl_den = nes->is_pal ? 16 : 3;
     int total_sl = nes->num_scanlines;
     int skip_dot = 0;
+    /* Last post-render line index and last vblank line (pre-render = total_sl-1). */
+    int sl_post = 240;
+    int sl_vbl_last = total_sl - 2; /* 260 NTSC / 310 PAL */
+    int sl_pre = total_sl - 1;
 
     for (int y = 0; y < 240; y++) {
         if (nes->ppu_mask & 0x18) copy_scroll_x(nes);
@@ -360,10 +455,10 @@ void run_frame(struct NES *nes) {
 
         /* CPU window for this line — mid-line $2001 uses ppu_cur_scanline. */
         nes->ppu_cur_scanline = (s16)y;
-        step_cpu_apu_until(nes, irq_target, 0, 0);
+        step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0);
         mapper_scanline_clock(nes);
 
-        step_cpu_apu_until(nes, target, 0, 0);
+        step_cpu_apu_until(nes, target, -1, 0, -1, 0);
         nes->ppu_cur_scanline = -1;
         /* Overlap flag is consumed on $2001 mid-line; drop at hblank. */
         nes->sp0_overlap = 0;
@@ -371,9 +466,7 @@ void run_frame(struct NES *nes) {
 
     for (int y = 240; y < total_sl; y++) {
         int sl_start = target;
-        if (y == total_sl - 1) {
-            nes->ppu_status &= ~0xE0;
-            nes->in_vblank = 0;
+        if (y == sl_pre) {
             nes->sp0_overlap = 0;
             /*
              * Hardware forces OAMADDR through 0 on dots 257–320 of pre-render
@@ -383,34 +476,45 @@ void run_frame(struct NES *nes) {
             nes->oam_addr = 0;
             if (nes->ppu_mask & 0x18) copy_scroll_y(nes);
         }
-        if (y == total_sl - 2)
+        if (y == sl_vbl_last)
             skip_dot = !nes->is_pal && nes->odd_frame && (nes->ppu_mask & 0x18);
         int cur_sl_num = sl_num;
-        if (y == total_sl - 1 && skip_dot)
+        if (y == sl_pre && skip_dot)
             cur_sl_num = 340;
         sl_acc += cur_sl_num;
         target += sl_acc / sl_den;
         sl_acc %= sl_den;
 
-        if (y == total_sl - 1) {
+        if (y == sl_pre) {
             int irq_target = target - (cur_sl_num / sl_den) + (260 * sl_num) / (341 * sl_den);
-            step_cpu_apu_until(nes, irq_target, 0, 0);
+            step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0);
             mapper_scanline_clock(nes);
         }
 
         /*
-         * VBlank NMI at the scanline 240→241 boundary (start of vblank / dot 0–1).
-         * Trigger during the last instruction of post-render when possible so
-         * nmi_in_instr is set for BRK/IRQ hijack (AccuracyCoin NmiAndBrk/Irq).
-         * Fallback on 241 if the CPU had not reached the boundary yet.
+         * VBlank flag/NMI: set near SL241 dot 1.
+         * Hardware: 241*341+1 PPU from frame start ≈ one PPU past the 240→241
+         * boundary. With 3 PPU/CPU we arm one CPU cycle before `target` (end of
+         * post-render) so AccuracyCoin's A=0..6 window matches (was one step
+         * late: five $02s and no suppression slot).
+         * Clear at end of last vblank line (= pre-render start).
+         * $2002 read on the set cycle suppresses the flag (begin_vblank).
          */
-        if (y == 240)
-            step_cpu_apu_until(nes, target, target, &vblank_nmi_done);
+        if (y == sl_post)
+            step_cpu_apu_until(nes, target, target, &vblank_nmi_done, -1, 0);
         else if (y == 241 && !vblank_nmi_done)
-            step_cpu_apu_until(nes, target, sl_start + 1, &vblank_nmi_done);
+            step_cpu_apu_until(nes, target, sl_start, &vblank_nmi_done, -1, 0);
+        else if (y == sl_vbl_last)
+            step_cpu_apu_until(nes, target, -1, 0, target, &vblank_clr_done);
+        else if (y == sl_pre && !vblank_clr_done)
+            step_cpu_apu_until(nes, target, -1, 0, sl_start, &vblank_clr_done);
         else
-            step_cpu_apu_until(nes, target, 0, 0);
+            step_cpu_apu_until(nes, target, -1, 0, -1, 0);
     }
+
+    /* Safety: never leave VBlank stuck if clear event was missed. */
+    if (!vblank_clr_done)
+        end_vblank(nes);
 
     nes->frame_cycle_rem = sl_acc;
     nes->frame_cpu_overrun = nes->cycles - target;
@@ -423,6 +527,7 @@ void run_frame(struct NES *nes) {
     if (!nes->is_pal)
         nes->odd_frame ^= 1;
 }
+
 
 void scale_to_framebuf(u32 *fb, const u8 *scr, u8 mask) {
     int grey = mask & 0x01;
