@@ -240,13 +240,17 @@ static void end_vblank(struct NES *nes) {
  *   clr_cycle  — clear VBlank flags (pass clr_done non-NULL)
  * Use cycle < 0 to disable an event.
  *
- * Same-cycle $2002 race (AccuracyCoin VBlank beginning A=4 / NMI Suppression):
- * if VBL lands on the read cycle of an abs $2002 load, run the instruction
- * first so the read sees 0, then enter vblank without setting bit 7 / NMI.
+ * vbl_phase: PPU remainder (sl_acc) at the VBL set line. Hardware $2002
+ * suppress is 1 PPU wide; a CPU data cycle is 3 PPU, so ungated race gives
+ * three AccuracyCoin A slots of $00. Only suppress when phase matches
+ * VBL_RACE_PHASE (Beginning → 02 02 02 02 00 01 01).
  */
+#define VBL_RACE_PHASE 0
+
 static void step_cpu_apu_until(struct NES *nes, int target,
                               int nmi_cycle, int *nmi_done,
-                              int clr_cycle, int *clr_done) {
+                              int clr_cycle, int *clr_done,
+                              int vbl_phase) {
     if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
         begin_vblank(nes, 0, 0);
         *nmi_done = 1;
@@ -259,19 +263,18 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         int hint = cpu_next_cycles_hint(nes);
         int start = nes->cycles;
         int race = 0;
-        int is_ldx_ldy_2002 = abs_load_is_ppu_status(nes);
+        int is_ldx_2002 = abs_load_is_ppu_status(nes);
+        int phase_race = ((vbl_phase % 3) == VBL_RACE_PHASE);
 
-        /*
-         * Inclusive set (keeps VblSync/End). LDX $2002 race on data cycle.
-         * Also: VBL in the first CPU after LDX $2002 (between LDX and LDY) is
-         * treated as suppress — that is the A=4 window AccuracyCoin expects.
-         */
+        /* Inclusive set (VblSync/End). Phase-gated LDX $2002 suppress. */
         if (nmi_done && !*nmi_done && nmi_cycle >= 0
             && start < nmi_cycle && start + hint >= nmi_cycle) {
             int ic = nmi_cycle - start;
-            if (is_ldx_ldy_2002 && hint > 0 && ic == hint - 1)
-                race = 1;
-            else {
+            if (is_ldx_2002 && hint > 0 && ic == hint - 1) {
+                if (phase_race)
+                    race = 1;
+                /* else: set after LDX (read saw 0, then flag rises). */
+            } else {
                 begin_vblank(nes, 1, ic > 0 ? ic : 1);
                 *nmi_done = 1;
             }
@@ -282,7 +285,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             *clr_done = 1;
         }
 
-        int was_ldx_2002 = is_ldx_ldy_2002;
+        int was_ldx_2002 = is_ldx_2002;
         int ldx_end = start + hint;
 
         step_cpu_apu(nes);
@@ -291,9 +294,9 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             begin_vblank_suppressed(nes);
             *nmi_done = 1;
         }
-        /* VBL one CPU after LDX $2002 ends (deep in LDX/LDY gap) → suppress. */
-        if (was_ldx_2002 && nmi_done && !*nmi_done && nmi_cycle >= 0
-            && nmi_cycle == ldx_end + 1) {
+        /* VBL one CPU into the LDX→LDY gap: same 1-PPU-wide suppress window. */
+        if (was_ldx_2002 && phase_race && nmi_done && !*nmi_done
+            && nmi_cycle >= 0 && nmi_cycle == ldx_end + 1) {
             begin_vblank_suppressed(nes);
             *nmi_done = 1;
         }
@@ -477,10 +480,10 @@ void run_frame(struct NES *nes) {
 
         /* CPU window for this line — mid-line $2001 uses ppu_cur_scanline. */
         nes->ppu_cur_scanline = (s16)y;
-        step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0);
+        step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0, 0);
         mapper_scanline_clock(nes);
 
-        step_cpu_apu_until(nes, target, -1, 0, -1, 0);
+        step_cpu_apu_until(nes, target, -1, 0, -1, 0, 0);
         nes->ppu_cur_scanline = -1;
         /* Overlap flag is consumed on $2001 mid-line; drop at hblank. */
         nes->sp0_overlap = 0;
@@ -509,29 +512,25 @@ void run_frame(struct NES *nes) {
 
         if (y == sl_pre) {
             int irq_target = target - (cur_sl_num / sl_den) + (260 * sl_num) / (341 * sl_den);
-            step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0);
+            step_cpu_apu_until(nes, irq_target, -1, 0, -1, 0, 0);
             mapper_scanline_clock(nes);
         }
 
         /*
-         * VBlank flag/NMI: set near SL241 dot 1.
-         * Hardware: 241*341+1 PPU from frame start ≈ one PPU past the 240→241
-         * boundary. With 3 PPU/CPU we arm one CPU cycle before `target` (end of
-         * post-render) so AccuracyCoin's A=0..6 window matches (was one step
-         * late: five $02s and no suppression slot).
+         * VBlank flag/NMI: set at end of post-render (≈ SL241.0/1).
          * Clear at end of last vblank line (= pre-render start).
-         * $2002 read on the set cycle suppresses the flag (begin_vblank).
+         * sl_acc after the set line is the PPU phase for 1-dot $2002 race.
          */
         if (y == sl_post)
-            step_cpu_apu_until(nes, target, target, &vblank_nmi_done, -1, 0);
+            step_cpu_apu_until(nes, target, target, &vblank_nmi_done, -1, 0, sl_acc);
         else if (y == 241 && !vblank_nmi_done)
-            step_cpu_apu_until(nes, target, sl_start, &vblank_nmi_done, -1, 0);
+            step_cpu_apu_until(nes, target, sl_start, &vblank_nmi_done, -1, 0, sl_acc);
         else if (y == sl_vbl_last)
-            step_cpu_apu_until(nes, target, -1, 0, target, &vblank_clr_done);
+            step_cpu_apu_until(nes, target, -1, 0, target, &vblank_clr_done, 0);
         else if (y == sl_pre && !vblank_clr_done)
-            step_cpu_apu_until(nes, target, -1, 0, sl_start, &vblank_clr_done);
+            step_cpu_apu_until(nes, target, -1, 0, sl_start, &vblank_clr_done, 0);
         else
-            step_cpu_apu_until(nes, target, -1, 0, -1, 0);
+            step_cpu_apu_until(nes, target, -1, 0, -1, 0, 0);
     }
 
     /* Safety: never leave VBlank stuck if clear event was missed. */
