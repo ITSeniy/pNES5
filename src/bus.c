@@ -309,8 +309,12 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
             nes->ppu_ctrl = val;
             nes->temp_addr = (nes->temp_addr & 0xF3FF) | ((val & 3) << 10);
             if (!(prev & 0x80) && (val & 0x80) && (nes->ppu_status & 0x80)) {
+                /*
+                 * Enable while VBlank already set → rising NMI edge.
+                 * No nmi_delay: take at the next instruction boundary
+                 * (blargg 07-nmi_on_timing; delay=1 was one instr too late).
+                 */
                 nes->nmi_pending = 1;
-                nes->nmi_delay = 1;
             }
             break;
         }

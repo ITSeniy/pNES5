@@ -189,11 +189,16 @@ static int abs_load_is_ppu_status(struct NES *nes) {
         return 0;
     switch (op) {
     /*
-     * LDX abs $2002 only for the set-race (Beginning's first of two reads).
-     * Racing LDY too widened the $00 zone into the after-region ($01).
-     * LDA/BIT are used by VblSync — never race those.
+     * LDX abs: VBlank Beginning (LDX then LDY).
+     * LDA abs only when NMI is enabled: NMI Suppression. VblSync uses LDA
+     * $2002 with NMI off — racing that desyncs the pretest/sync loops.
+     * Not LDY (widens Beginning $00) or BIT (VblSync end).
      */
     case 0xAE: /* LDX abs */
+        break;
+    case 0xAD: /* LDA abs */
+        if (!(nes->ppu_ctrl & 0x80))
+            return 0;
         break;
     default:
         return 0;
@@ -226,12 +231,21 @@ static void begin_vblank(struct NES *nes, int during_cpu_step, int instr_cycle) 
 static void begin_vblank_suppressed(struct NES *nes) {
     nes->in_vblank = 1;
     nes->ppu_status &= ~0x80;
+    /* No rising edge — do not arm NMI. */
+    nes->nmi_pending = 0;
+    nes->nmi_delay = 0;
+    nes->nmi_in_instr = 0;
 }
 
 static void end_vblank(struct NES *nes) {
     /* Same instant as pre-render: clear VBlank + sprite0 + overflow. */
     nes->ppu_status &= ~0xE0;
     nes->in_vblank = 0;
+    /*
+     * NMI is edge-latched in the CPU: clearing VBlank drops the PPU NMI
+     * line but does not un-latch an edge that already occurred. Leave
+     * nmi_pending alone so NMI-at-VBL-end still fires after enable.
+     */
 }
 
 /*
