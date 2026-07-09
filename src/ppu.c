@@ -280,14 +280,33 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         int is_ldx_2002 = abs_load_is_ppu_status(nes);
         int phase_race = ((vbl_phase % 3) == VBL_RACE_PHASE);
 
-        /* Inclusive set (VblSync/End). Phase-gated LDX $2002 suppress. */
+        /* Inclusive set. Phase-gated $2002 suppress / NMI Suppression. */
         if (nmi_done && !*nmi_done && nmi_cycle >= 0
             && start < nmi_cycle && start + hint >= nmi_cycle) {
             int ic = nmi_cycle - start;
-            if (is_ldx_2002 && hint > 0 && ic == hint - 1) {
+            int nmi_on = (nes->ppu_ctrl & 0x80) != 0;
+            if (ic >= hint) {
+                /*
+                 * VBL at instruction end.
+                 * NMI off: pre-set (Beginning/End).
+                 * NMI on + phase: mid-arm → $2002 can yield $01 (V no N).
+                 * NMI on + other: set after → next instr takes NMI ($03).
+                 */
+                int ph = vbl_phase % 3;
+                if (!nmi_on || ph == VBL_RACE_PHASE) {
+                    begin_vblank(nes, 1, ic > 0 ? ic : 1);
+                    *nmi_done = 1;
+                }
+            } else if (is_ldx_2002 && hint > 0 && ic == hint - 1) {
                 if (phase_race)
                     race = 1;
-                /* else: set after LDX (read saw 0, then flag rises). */
+                else if (nmi_on) {
+                    begin_vblank(nes, 0, 0);
+                    *nmi_done = 1;
+                }
+            } else if (is_ldx_2002 && nmi_on) {
+                begin_vblank(nes, 0, 0);
+                *nmi_done = 1;
             } else {
                 begin_vblank(nes, 1, ic > 0 ? ic : 1);
                 *nmi_done = 1;
