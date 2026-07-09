@@ -133,6 +133,8 @@ struct NES {
     u8  cpu_data_bus;
 
     u8  pad_state, pad_shift, pad_strobe;
+    /* Internal OUT0 ($4016 bit0); external pin updates only on put cycles. */
+    u8  pad_out0;
     /* Contiguous joypad OE coalescing (NES/AV Famicom, not RF Famicom). */
     u16 joy_oe_addr;
     u8  joy_last_bit;
@@ -146,6 +148,8 @@ struct NES {
     struct dmc_ch      dmc;
     u8  apu_status, frame_mode, frame_irq_inhibit;
     u8  frame_irq_flag, frame_reset_delay, frame_reset_mode;
+    /* AccuracyCoin: $4015 clears frame IRQ only on put→get (next get cycle). */
+    u8  frame_irq_clear_pending;
     s32 frame_counter, sample_acc;
     s32 fc_step[2][6];
 
@@ -186,6 +190,8 @@ void cpu_dma_repeat_read(struct NES *nes);
 /* apu.c — DMC memory reader / timer (may stall CPU / affect SH*) */
 void dmc_service_dma(struct NES *nes);
 void dmc_tick(struct NES *nes);
+/* Put/get half-cycle side effects before a CPU bus access (frame IRQ clear). */
+void apu_on_cpu_cycle_begin(struct NES *nes);
 
 /* cpu.c */
 void cpu_step(struct NES *nes);

@@ -16,7 +16,7 @@
 #define COL_NUM      0x21
 #define ROM_BUF_SIZE 0x400000
 #define STATE_MAGIC 0x30545345u /* EST0 */
-#define STATE_VERSION 8u
+#define STATE_VERSION 9u
 #define CMD_STATE_LOAD 0xFC
 #define CMD_STATE_SAVE 0xFD
 #define CMD_MENU 0xFE
@@ -158,7 +158,7 @@ struct nes_state_core {
     u8  chr_enable;
 
     u8  cpu_data_bus;
-    u8  pad_state, pad_shift, pad_strobe;
+    u8  pad_state, pad_shift, pad_strobe, pad_out0;
     u8  irq_pending, prev_irq_inhibit, apu_irq_pending;
     struct pulse_ch    pulse[2];
     struct triangle_ch tri;
@@ -166,6 +166,7 @@ struct nes_state_core {
     struct dmc_ch      dmc;
     u8  apu_status, frame_mode, frame_irq_inhibit;
     u8  frame_irq_flag, frame_reset_delay, frame_reset_mode;
+    u8  frame_irq_clear_pending;
     s32 frame_counter, sample_acc;
     s16 lpf_prev;
     s32 hpf_in, hpf_out;
@@ -237,13 +238,15 @@ static void capture_state(struct NES *nes, struct nes_state_core *st) {
 
     st->cpu_data_bus = nes->cpu_data_bus;
     st->pad_state = nes->pad_state; st->pad_shift = nes->pad_shift;
-    st->pad_strobe = nes->pad_strobe; st->irq_pending = nes->irq_pending;
+    st->pad_strobe = nes->pad_strobe; st->pad_out0 = nes->pad_out0;
+    st->irq_pending = nes->irq_pending;
     st->prev_irq_inhibit = nes->prev_irq_inhibit; st->apu_irq_pending = nes->apu_irq_pending;
     st->pulse[0] = nes->pulse[0]; st->pulse[1] = nes->pulse[1];
     st->tri = nes->tri; st->noise = nes->noise; st->dmc = nes->dmc;
     st->apu_status = nes->apu_status; st->frame_mode = nes->frame_mode;
     st->frame_irq_inhibit = nes->frame_irq_inhibit; st->frame_irq_flag = nes->frame_irq_flag;
     st->frame_reset_delay = nes->frame_reset_delay; st->frame_reset_mode = nes->frame_reset_mode;
+    st->frame_irq_clear_pending = nes->frame_irq_clear_pending;
     st->frame_counter = nes->frame_counter; st->sample_acc = nes->sample_acc;
     st->lpf_prev = nes->lpf_prev; st->hpf_in = nes->hpf_in; st->hpf_out = nes->hpf_out;
     st->cpu_freq = nes->cpu_freq; st->num_scanlines = nes->num_scanlines;
@@ -314,6 +317,7 @@ static int restore_state(struct NES *nes, const struct nes_state_core *st) {
 
     nes->cpu_data_bus = st->cpu_data_bus;
     nes->pad_state = 0; nes->pad_shift = st->pad_shift; nes->pad_strobe = st->pad_strobe;
+    nes->pad_out0 = st->pad_out0;
     nes->irq_pending = st->irq_pending; nes->prev_irq_inhibit = st->prev_irq_inhibit;
     nes->apu_irq_pending = st->apu_irq_pending;
     nes->pulse[0] = st->pulse[0]; nes->pulse[1] = st->pulse[1];
@@ -321,6 +325,7 @@ static int restore_state(struct NES *nes, const struct nes_state_core *st) {
     nes->apu_status = st->apu_status; nes->frame_mode = st->frame_mode;
     nes->frame_irq_inhibit = st->frame_irq_inhibit; nes->frame_irq_flag = st->frame_irq_flag;
     nes->frame_reset_delay = st->frame_reset_delay; nes->frame_reset_mode = st->frame_reset_mode;
+    nes->frame_irq_clear_pending = st->frame_irq_clear_pending;
     nes->frame_counter = st->frame_counter; nes->sample_acc = st->sample_acc;
     nes->lpf_prev = st->lpf_prev; nes->hpf_in = st->hpf_in; nes->hpf_out = st->hpf_out;
     nes->frame_cycle_rem = st->frame_cycle_rem; nes->frame_cpu_overrun = st->frame_cpu_overrun;

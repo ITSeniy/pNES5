@@ -101,14 +101,49 @@ static void update_apu_irq(struct NES *nes) {
     nes->apu_irq_pending = (nes->frame_irq_flag || nes->dmc.irq_flag) ? 1 : 0;
 }
 
+/*
+ * Absolute CPU cycle index for the bus access about to run (before dmc_tick).
+ * Even = get, odd = put (AccuracyCoin OAM $4014 syncs so the next opcode is get).
+ */
+static s32 cpu_bus_cycle(struct NES *nes) {
+    return nes->total_cycles + nes->dmc.ticks_exec;
+}
+
+/* Frame IRQ flag clears only on put→get (start of a get cycle). */
+void apu_on_cpu_cycle_begin(struct NES *nes) {
+    if ((cpu_bus_cycle(nes) & 1) == 0 && nes->frame_irq_clear_pending) {
+        nes->frame_irq_flag = 0;
+        nes->frame_irq_clear_pending = 0;
+        update_apu_irq(nes);
+    }
+}
+
+/* OUT0 is only driven on put cycles (get→put); internal latch may change earlier. */
+static void joy_apply_out0_put(struct NES *nes) {
+    nes->pad_strobe = nes->pad_out0;
+    if (nes->pad_out0)
+        nes->pad_shift = nes->pad_state;
+}
+
 static void dmc_restart(struct NES *nes) {
     nes->dmc.cur_addr = nes->dmc.sample_addr;
     nes->dmc.bytes_left = nes->dmc.sample_len;
 }
 
 static void dmc_request_dma(struct NES *nes, int is_load) {
-    if (!(nes->dmc.enabled && nes->dmc.bytes_left > 0 && !nes->dmc.sample_buf_full))
+    if (nes->dmc.sample_buf_full)
         return;
+    /*
+     * Load ($4015): needs enabled channel with bytes remaining.
+     * Reload (buffer empty): if still enabled, needs bytes; if disabled,
+     * stay pending until re-enabled (AccuracyCoin DMC tests L–N).
+     */
+    if (is_load) {
+        if (!nes->dmc.enabled || nes->dmc.bytes_left == 0)
+            return;
+    } else if (nes->dmc.enabled && nes->dmc.bytes_left == 0) {
+        return;
+    }
     /*
      * Always queue pending even during reentry (output unit may empty again
      * while a get is finishing). Load delay only for true load DMAs.
@@ -134,9 +169,23 @@ static void dmc_request_dma(struct NES *nes, int is_load) {
  * the first reload hundreds of cycles late, breaking every DMASync residual.
  */
 void dmc_tick(struct NES *nes) {
+    /*
+     * Cycle side effects for the access that just finished:
+     * put cycles push internal OUT0 to the controller ports (AccuracyCoin
+     * Controller Strobing tests 3–4).
+     */
+    s32 cyc = cpu_bus_cycle(nes);
     nes->dmc.ticks_exec++;
+    if (cyc & 1)
+        joy_apply_out0_put(nes);
+
+    /*
+     * Timer free-runs after the channel has been used: keep clocking while
+     * bits remain, a sample is buffered, or a DMA is waiting for enable
+     * (AccuracyCoin DMC test L — disable then re-enable near timer expiry).
+     */
     if (!nes->dmc.enabled && nes->dmc.bytes_left == 0 && !nes->dmc.sample_buf_full
-        && !nes->dmc.dma_pending)
+        && !nes->dmc.dma_pending && nes->dmc.bits_left == 0)
         return;
     if (nes->dmc.timer_count > 0) {
         nes->dmc.timer_count--;
@@ -158,6 +207,7 @@ void dmc_tick(struct NES *nes) {
             dmc_request_dma(nes, 0);
         } else {
             nes->dmc.silence = 1;
+            /* Need a byte: stay pending even if still disabled (test L). */
             dmc_request_dma(nes, 0);
         }
     }
@@ -193,9 +243,9 @@ static u8 dmc_fetch_sample(struct NES *nes, u16 a) {
     {
         u16 apu = (u16)(0x4000 | (a & 0x1F));
         if (apu == 0x4015) {
-            /* Internal read: clear frame IRQ; external bus keeps sample. */
-            nes->frame_irq_flag = 0;
-            nes->apu_irq_pending = nes->dmc.irq_flag ? 1 : 0;
+            /* Internal read: schedule frame IRQ clear (put→get), bus keeps sample. */
+            nes->frame_irq_clear_pending = 1;
+            update_apu_irq(nes);
         } else if (apu == 0x4016 || apu == 0x4017) {
             nes->cpu_data_bus = sample;
             u8 joy = cpu_read_nodma(nes, apu);
@@ -235,10 +285,16 @@ void dmc_service_dma(struct NES *nes) {
         return;
     }
 
-    if (!nes->dmc.enabled || nes->dmc.bytes_left == 0 || nes->dmc.sample_buf_full) {
+    if (nes->dmc.sample_buf_full) {
         nes->dmc.dma_pending = 0;
         return;
     }
+    /*
+     * Channel not ready yet (e.g. $4015 load delay still counting, or still
+     * disabled after buffer empty): keep pending and try again next read.
+     */
+    if (!nes->dmc.enabled || nes->dmc.bytes_left == 0)
+        return;
 
     nes->dmc.dma_reentry = 1;
     nes->dmc.dma_pending = 0;
@@ -276,6 +332,7 @@ void dmc_service_dma(struct NES *nes) {
 
         nes->cycles += stall;
         for (int i = 0; i < dummies; i++) {
+            apu_on_cpu_cycle_begin(nes);
             if (halt != 0xFFFF)
                 (void)cpu_read_nodma(nes, halt);
             dmc_tick(nes);
@@ -455,19 +512,22 @@ void apu_write_reg(struct NES *nes, u16 addr, u8 val) {
              * pending get becomes an abort after this load completes — see
              * dmc_service_dma / dma_reload_race.
              *
-             * Arm the timer for a full period at the *current* rate without
-             * processing a bit. timer_count==0 would expire on the next
-             * dmc_tick and start a silence byte before the load DMA fills
-             * the buffer, delaying the first reload by ~7 bit-periods.
+             * Do NOT reset the rate timer here: it free-runs across disable
+             * and re-enable (AccuracyCoin DMC tests L–N time $4015 against
+             * the existing timer phase). Only arm a silent period when the
+             * timer was fully idle (never started / fully stopped).
              */
             u8 had_reload = nes->dmc.dma_pending && !nes->dmc.dma_is_load;
-            {
+            if (nes->dmc.bits_left == 0 && !nes->dmc.sample_buf_full
+                && !nes->dmc.dma_pending) {
                 u16 dmc_period = nes->is_pal
                     ? dmc_period_pal[nes->dmc.period_idx]
                     : dmc_period_ntsc[nes->dmc.period_idx];
-                nes->dmc.timer_count = dmc_period ? dmc_period - 1 : 0;
-                nes->dmc.bits_left = 0;
-                nes->dmc.silence = 1;
+                /* Cold start only: timer was not free-running. */
+                if (nes->dmc.timer_count == 0) {
+                    nes->dmc.timer_count = dmc_period ? dmc_period - 1 : 0;
+                    nes->dmc.silence = 1;
+                }
             }
             dmc_restart(nes);
             dmc_request_dma(nes, 1);
@@ -480,11 +540,13 @@ void apu_write_reg(struct NES *nes, u16 addr, u8 val) {
         nes->frame_irq_inhibit = (val >> 6) & 1;
         if (nes->frame_irq_inhibit) {
             nes->frame_irq_flag = 0;
+            nes->frame_irq_clear_pending = 0;
             update_apu_irq(nes);
         }
         nes->frame_reset_mode = nes->frame_mode;
-        if ((nes->total_cycles + 1) & 1) nes->frame_reset_delay = 1;
-        else frame_reset(nes);
+        /* 3 vs 4 CPU delay after $4017 depends on write get/put polarity. */
+        if (cpu_bus_cycle(nes) & 1) nes->frame_reset_delay = 1; /* put → 3 */
+        else frame_reset(nes); /* get → effectively 4 with instruction apu_step */
         break;
     }
 }

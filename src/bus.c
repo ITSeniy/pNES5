@@ -138,8 +138,13 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
         if (nes->dmc.bytes_left > 0) result |= 0x10;
         if (nes->frame_irq_flag) result |= 0x40;
         if (nes->dmc.irq_flag) result |= 0x80;
-        nes->frame_irq_flag = 0;
-        nes->apu_irq_pending = nes->dmc.irq_flag ? 1 : 0;
+        /*
+         * Frame IRQ (bit 6) is not cleared on this cycle if it is a put cycle;
+         * it clears on the next put→get (AccuracyCoin Frame Counter IRQ 6–7).
+         * Reading still samples the current flag value above.
+         */
+        nes->frame_irq_clear_pending = 1;
+        nes->apu_irq_pending = (nes->frame_irq_flag || nes->dmc.irq_flag) ? 1 : 0;
         /* Internal $4015 does not drive the external data bus. */
         result = (result & (u8)~0x20) | (nes->cpu_data_bus & 0x20);
         skip_bus_update = 1;
@@ -204,6 +209,8 @@ u8 cpu_read(struct NES *nes, u16 addr) {
      * Side-effect ports ($2007/$4015/$4016) still need the get on the data
      * address — that requires residual phase, not stream defer.
      */
+    apu_on_cpu_cycle_begin(nes);
+
     if (nes->dmc.dma_pending && !nes->dmc.dma_reentry) {
         if (nes->dmc.dma_halt_delay > 0 && !nes->dmc.dma_abort) {
             nes->dmc.dma_halt_delay--;
@@ -251,12 +258,25 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
      * DMA cannot halt on a write cycle — never service dma_pending here.
      * Pending gets wait until the next CPU read.
      */
+    apu_on_cpu_cycle_begin(nes);
+
     if (addr == 0x4010 || addr == 0x4015 || addr == 0x4017) {
         nes->cpu_data_bus = val;
         nes->joy_oe_addr = 0;
         apu_write_reg(nes, addr, val);
         /* Keep write data on the bus after any load-DMA side effects. */
         nes->cpu_data_bus = val;
+        dmc_tick(nes);
+        return;
+    }
+
+    if (addr == 0x4016) {
+        /*
+         * OUT0 latched before put-cycle apply in dmc_tick (Controller Strobing).
+         */
+        nes->cpu_data_bus = val;
+        nes->joy_oe_addr = 0;
+        nes->pad_out0 = val & 1;
         dmc_tick(nes);
         return;
     }
@@ -318,9 +338,11 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
         /*
          * OAM DMA: halt + optional align + 256 get/put pairs (513/514).
          * DMC may steal ~2 cycles mid-transfer (see dmc_service_dma).
+         * Alignment uses the current bus-cycle parity so the next CPU opcode
+         * starts on a get cycle (AccuracyCoin APU get/put sync).
          */
         u16 base = (u16)val << 8;
-        int odd = (nes->total_cycles + nes->cycles) & 1;
+        int odd = (nes->total_cycles + nes->dmc.ticks_exec) & 1;
         nes->dmc.oam_dma_active = 1;
         nes->cycles += 1;
         dmc_tick(nes);
@@ -334,6 +356,7 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
                 nes->dmc.halt_addr = 0xFFFF;
                 dmc_service_dma(nes);
             }
+            apu_on_cpu_cycle_begin(nes);
             u8 b = cpu_read_nodma(nes, (u16)(base + i));
             nes->oam[(nes->oam_addr + i) & 0xFF] = b;
             nes->cycles += 2;
@@ -349,15 +372,6 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
 
     if (addr >= 0x4000 && addr <= 0x4013) {
         apu_write_reg(nes, addr, val);
-        return;
-    }
-
-    if (addr == 0x4016) {
-        if (val & 1)
-            nes->pad_shift = nes->pad_state;
-        else if (nes->pad_strobe)
-            nes->pad_shift = nes->pad_state;
-        nes->pad_strobe = val & 1;
         return;
     }
 
