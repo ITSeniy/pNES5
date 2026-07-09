@@ -680,9 +680,14 @@ void apu_step(struct NES *nes, int cycles) {
 
         update_apu_irq(nes);
 
+        /*
+         * Resample APU to 48 kHz. Use host-matched divisors (NTSC_SAMPLE_DIV /
+         * PAL_SAMPLE_DIV) so vsync-locked playback does not underrun AudioOut.
+         */
+        s32 sample_div = nes->is_pal ? (s32)PAL_SAMPLE_DIV : (s32)NTSC_SAMPLE_DIV;
         nes->sample_acc += SAMPLE_RATE;
-        if (nes->sample_acc >= nes->cpu_freq) {
-            nes->sample_acc -= nes->cpu_freq;
+        if (nes->sample_acc >= sample_div) {
+            nes->sample_acc -= sample_div;
 
             int p1 = 0, p2 = 0, tri_out = 0, noi = 0, dmc = nes->dmc.output_level;
             for (int ch = 0; ch < 2; ch++) {
@@ -701,9 +706,15 @@ void apu_step(struct NES *nes, int cycles) {
             int ts = 3 * tri_out + 2 * noi + dmc; if (ts > 202) ts = 202;
             s32 raw = (s32)mix_pulse(ps) + (s32)mix_tnd(ts);
 
-            s32 lp = (raw * 6 + nes->lpf_prev * 10) / 16;
+            /* One-pole LPF softens square/noise edges (reduces alias "grit"). */
+            s32 lp = (raw * 5 + (s32)nes->lpf_prev * 11) / 16;
             nes->lpf_prev = (s16)lp;
-            s32 hp = lp - nes->hpf_in + (nes->hpf_out * 255 / 256);
+            /*
+             * DC blocker: y = x - x_z1 + R*y_z1 with R = 255/256.
+             * Use arithmetic >> 8 instead of *255/256 so negatives decay correctly
+             * (C truncates toward zero and can leave a sticky residual).
+             */
+            s32 hp = lp - nes->hpf_in + nes->hpf_out - (nes->hpf_out >> 8);
             nes->hpf_in = lp;
             nes->hpf_out = hp;
 
@@ -721,6 +732,7 @@ void apu_step(struct NES *nes, int cycles) {
 void apu_flush(struct NES *nes) {
     if (nes->audio_handle < 0 || !nes->audio_out_fn) return;
     while (nes->audio_pos >= SAMPLES_PER_BUF) {
+        /* sceAudioOutOutput blocks until the grain is queued (and copies it). */
         NC(nes->gadget, nes->audio_out_fn,
            (u64)nes->audio_handle, (u64)nes->audio_buf, 0, 0, 0, 0);
         int rem = nes->audio_pos - SAMPLES_PER_BUF;
@@ -736,10 +748,16 @@ void apu_prime(struct NES *nes, int buffers) {
     for (int i = 0; i < SAMPLES_PER_BUF * 2; i++)
         nes->audio_buf[i] = 0;
 
+    if (buffers < 1) buffers = 1;
+    if (buffers > 8) buffers = 8;
     for (int i = 0; i < buffers; i++) {
         NC(nes->gadget, nes->audio_out_fn,
            (u64)nes->audio_handle, (u64)nes->audio_buf, 0, 0, 0, 0);
     }
 
     nes->audio_pos = 0;
+    nes->sample_acc = 0;
+    nes->lpf_prev = 0;
+    nes->hpf_in = 0;
+    nes->hpf_out = 0;
 }

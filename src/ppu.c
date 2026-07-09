@@ -619,31 +619,64 @@ void run_frame(struct NES *nes) {
 }
 
 
-void scale_to_framebuf(u32 *fb, const u8 *scr, u8 mask) {
+static u32 scale_pixel_color(u8 idx, int grey, int emph_r, int emph_g, int emph_b) {
+    if (grey) idx &= 0x30;
+    u32 c = nes_rgb(idx);
+    if (emph_r | emph_g | emph_b) {
+        u32 r = (c >> 16) & 0xFF;
+        u32 g = (c >> 8) & 0xFF;
+        u32 b = c & 0xFF;
+        if (emph_g | emph_b) r = r * 3 / 4;
+        if (emph_r | emph_b) g = g * 3 / 4;
+        if (emph_r | emph_g) b = b * 3 / 4;
+        c = 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+    return c;
+}
+
+void scale_to_framebuf(u32 *fb, const u8 *scr, u8 mask, int scale_mode) {
     int grey = mask & 0x01;
     int emph_r = (mask >> 5) & 1;
     int emph_g = (mask >> 6) & 1;
     int emph_b = (mask >> 7) & 1;
 
-    for (int ny = 0; ny < NES_H; ny++) {
-        int sy = OFF_Y + ny * SCALE;
-        for (int nx = 0; nx < NES_W; nx++) {
-            u8 idx = scr[ny * NES_W + nx] & 0x3F;
-            if (grey) idx &= 0x30;
-            u32 c = nes_rgb(idx);
-            if (emph_r | emph_g | emph_b) {
-                u32 r = (c >> 16) & 0xFF;
-                u32 g = (c >> 8) & 0xFF;
-                u32 b = c & 0xFF;
-                if (emph_g | emph_b) r = r * 3 / 4;
-                if (emph_r | emph_b) g = g * 3 / 4;
-                if (emph_r | emph_g) b = b * 3 / 4;
-                c = 0xFF000000 | (r << 16) | (g << 8) | b;
+    /* Full-screen stretch: every host pixel samples nearest NES pixel. */
+    if (scale_mode == SCALE_MODE_STRETCH) {
+        for (int y = 0; y < SCR_H; y++) {
+            int ny = y * NES_H / SCR_H;
+            const u8 *src = scr + ny * NES_W;
+            u32 *row = fb + y * SCR_W;
+            for (int x = 0; x < SCR_W; x++) {
+                int nx = x * NES_W / SCR_W;
+                row[x] = scale_pixel_color(src[nx] & 0x3F, grey, emph_r, emph_g, emph_b);
             }
-            int sx = OFF_X + nx * SCALE;
-            for (int dy = 0; dy < SCALE; dy++) {
+        }
+        return;
+    }
+
+    int sc = SCALE;
+    if (scale_mode == SCALE_MODE_2X) sc = 2;
+    else if (scale_mode == SCALE_MODE_3X) sc = 3;
+    else if (scale_mode == SCALE_MODE_4X) sc = 4;
+    else {
+        /* Pixel-perfect: largest integer scale that fits the display. */
+        int sx = SCR_W / NES_W;
+        int sy = SCR_H / NES_H;
+        sc = sx < sy ? sx : sy;
+        if (sc < 1) sc = 1;
+    }
+
+    int off_x = (SCR_W - NES_W * sc) / 2;
+    int off_y = (SCR_H - NES_H * sc) / 2;
+
+    for (int ny = 0; ny < NES_H; ny++) {
+        int sy = off_y + ny * sc;
+        for (int nx = 0; nx < NES_W; nx++) {
+            u32 c = scale_pixel_color(scr[ny * NES_W + nx] & 0x3F, grey, emph_r, emph_g, emph_b);
+            int sx = off_x + nx * sc;
+            for (int dy = 0; dy < sc; dy++) {
                 u32 *row = &fb[(sy + dy) * SCR_W + sx];
-                for (int dx = 0; dx < SCALE; dx++)
+                for (int dx = 0; dx < sc; dx++)
                     row[dx] = c;
             }
         }

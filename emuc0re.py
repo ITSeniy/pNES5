@@ -36,7 +36,6 @@ ROMS_DIR = ROOT / "roms"
 PAYLOAD_PORT = 9026
 FTP_PORT = 1337
 LOG_PORT = 9027
-WEB_PORT = 9030
 JIT_SIZE = 0x10000
 
 
@@ -448,7 +447,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"  FTP not ready after {ftp_wait}s (emu may still be running)")
 
     print()
-    print("Done.  Web pad: http://{}:{}/".format(ps5, WEB_PORT))
+    print("Done.  Emulator running on {}".format(ps5))
     if log_stop is not None:
         print("UDP log active — Ctrl+C to exit listener")
         try:

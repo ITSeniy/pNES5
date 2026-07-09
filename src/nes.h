@@ -260,6 +260,6 @@ void draw_box(u8 *scr, int x, int y, int w, int h, u8 color);
 int  str_len(const char *s);
 int  is_rom_file(const char *name);
 void extract_rom_name(const char *fn, char *out, int max);
-void scale_to_framebuf(u32 *fb, const u8 *nes_screen, u8 ppu_mask);
+void scale_to_framebuf(u32 *fb, const u8 *nes_screen, u8 ppu_mask, int scale_mode);
 
 #endif

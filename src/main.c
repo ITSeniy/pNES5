@@ -17,13 +17,16 @@
 #define ROM_BUF_SIZE 0x400000
 #define STATE_MAGIC 0x30545345u /* EST0 */
 #define STATE_VERSION 12u
-#define CMD_STATE_LOAD 0xFC
-#define CMD_STATE_SAVE 0xFD
-#define CMD_MENU 0xFE
-#define CMD_EXIT 0xFF
+/* Rising-edge meta flags from DualSense (combine with NES buttons; never clobber). */
+#define META_SAVE      0x01
+#define META_LOAD      0x02
+#define META_SETTINGS  0x04
+#define META_EXIT      0x08
+#define META_RESET     0x10
+#define META_LIBRARY   0x20
 
-static const char *RESP_204K = "HTTP/1.1 204\r\nConnection:keep-alive\r\nAccess-Control-Allow-Origin:*\r\n\r\n";
-static const char *RESP_CORS = "HTTP/1.1 204\r\nAccess-Control-Allow-Origin:*\r\nAccess-Control-Allow-Methods:POST\r\nConnection:keep-alive\r\n\r\n";
+/* Turbo rate index → half-period in frames (A/B toggle). */
+static const u8 turbo_half[] = { 2, 3, 4, 6 }; /* ~30/20/15/10 Hz @60fps */
 
 static void init_ntsc(struct NES *nes);
 static void init_pal(struct NES *nes);
@@ -400,99 +403,6 @@ static void init_pal(struct NES *nes) {
     nes->fc_step[1][4] = 41565; nes->fc_step[1][5] = 41566;
 }
 
-static int poll_ready(void *G, void *poll, s32 fd, s32 timeout_ms) {
-    u8 pfd[8];
-    *(s32*)pfd = fd;
-    *(u16*)(pfd + 4) = 0x0001;
-    *(u16*)(pfd + 6) = 0;
-    return (s32)NC(G, poll, (u64)pfd, 1, (u64)timeout_ms, 0, 0, 0) > 0;
-}
-
-static int parse_pad_last(u8 *buf, s32 len) {
-    int val = -1;
-    for (s32 i = len - 2; i >= 1; i--) {
-        if (buf[i] == '/' && buf[i+1] == 'b') {
-            val = 0;
-            for (s32 j = i + 2; j < len && j < i + 8; j++) {
-                if (buf[j] >= '0' && buf[j] <= '9') val = val * 10 + (buf[j] - '0');
-                else break;
-            }
-            break;
-        }
-    }
-    return val;
-}
-
-static int count_posts(u8 *buf, s32 len) {
-    int c = 0;
-    for (s32 i = 0; i < len - 4; i++)
-        if (buf[i] == 'P' && buf[i+1] == 'O' && buf[i+2] == 'S' && buf[i+3] == 'T') c++;
-    return c;
-}
-
-static u8 web_handle(void *G, void *poll, void *accept, void *recv,
-                     void *send, void *close, void *sso, s32 listen_fd,
-                     s32 *keep_fd, u8 *page, u64 page_len, u8 *pad_out) {
-    u8 got_input = 0;
-    u8 req[512];
-
-    if (*keep_fd >= 0) {
-        for (int r = 0; r < 8; r++) {
-            if (!poll_ready(G, poll, *keep_fd, 0)) break;
-            s32 n = (s32)NC(G, recv, (u64)*keep_fd, (u64)req, 512, 0x80, 0, 0);
-            if (n <= 0) { NC(G, close, (u64)*keep_fd, 0,0,0,0,0); *keep_fd = -1; break; }
-            int v = parse_pad_last(req, n);
-            if (v >= 0) {
-                *pad_out = (u8)v;
-                got_input = 1;
-                int np = count_posts(req, n);
-                for (int k = 0; k < np; k++)
-                    NC(G, send, (u64)*keep_fd, (u64)RESP_204K, (u64)str_len(RESP_204K), 0, 0, 0);
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        if (!poll_ready(G, poll, listen_fd, 0)) break;
-
-        u8 sa[16]; s32 sa_len = 16;
-        s32 client = (s32)NC(G, accept, (u64)listen_fd, (u64)sa, (u64)&sa_len, 0, 0, 0);
-        if (client < 0) break;
-
-        if (sso) { s32 one = 1; NC(G, sso, (u64)client, 6, 1, (u64)&one, 4, 0); }
-
-        if (!poll_ready(G, poll, client, 0)) {
-            NC(G, close, (u64)client, 0, 0, 0, 0, 0);
-            continue;
-        }
-
-        s32 n = (s32)NC(G, recv, (u64)client, (u64)req, 512, 0x80, 0, 0);
-
-        if (n > 7 && req[0] == 'P' && req[5] == '/' && req[6] == 'b') {
-            int v = parse_pad_last(req, n);
-            if (v >= 0) { *pad_out = (u8)v; got_input = 1; }
-            NC(G, send, (u64)client, (u64)RESP_204K, (u64)str_len(RESP_204K), 0, 0, 0);
-            if (*keep_fd >= 0) NC(G, close, (u64)*keep_fd, 0,0,0,0,0);
-            *keep_fd = client;
-        } else if (n > 5 && req[0] == 'G' && req[4] == '/') {
-            u64 off = 0;
-            while (off < page_len) {
-                u64 chunk = page_len - off;
-                if (chunk > 2048) chunk = 2048;
-                NC(G, send, (u64)client, (u64)(page + off), chunk, 0, 0, 0);
-                off += chunk;
-            }
-            NC(G, close, (u64)client, 0, 0, 0, 0, 0);
-        } else if (n > 0 && req[0] == 'O') {
-            NC(G, send, (u64)client, (u64)RESP_CORS, (u64)str_len(RESP_CORS), 0, 0, 0);
-            NC(G, close, (u64)client, 0, 0, 0, 0, 0);
-        } else {
-            NC(G, close, (u64)client, 0, 0, 0, 0, 0);
-        }
-    }
-    return got_input;
-}
-
 static void nes_reset(struct NES *nes, void *G, void *audio_fn, s32 audio_h) {
     u8 *p = (u8 *)nes;
     for (u32 i = 0; i < sizeof(struct NES); i++) p[i] = 0;
@@ -503,32 +413,207 @@ static void nes_reset(struct NES *nes, void *G, void *audio_fn, s32 audio_h) {
     nes->noise.shift_reg = 1;
 }
 
-static u8 ds_to_nes(u32 b) {
-    u8 r = 0;
-    if (b & 0x00004000) r |= 0x01;  /* CROSS    → A     */
-    if (b & 0x00008000) r |= 0x02;  /* SQUARE   → B     */
-    if (b & 0x00001000) r |= 0x04;  /* TRIANGLE → Sel   */
-    if (b & 0x00002000) r |= 0x08;  /* CIRCLE   → Start */
-    if (b & 0x00000008) r |= 0x08;  /* OPTIONS  → Start */
-    if (b & 0x00000010) r |= 0x10;  /* UP              */
-    if (b & 0x00000040) r |= 0x20;  /* DOWN            */
-    if (b & 0x00000080) r |= 0x40;  /* LEFT            */
-    if (b & 0x00000020) r |= 0x80;  /* RIGHT           */
-    if (b & 0x00000100) r = CMD_STATE_SAVE; /* L2 -> Save state */
-    if (b & 0x00000200) r = CMD_STATE_LOAD; /* R2 -> Load state */
-    if (b & 0x00000400) r = CMD_MENU;       /* L1 -> Menu       */
-    if (b & 0x00000800) r = CMD_EXIT;       /* R1 -> Exit       */
-    return r;
+/* True if roms[j].filename equals name (NUL-terminated, max 47). */
+static int rom_name_eq(const struct rom_entry *e, const char *name) {
+    for (int c = 0; c < 47; c++) {
+        if (e->filename[c] != name[c]) return 0;
+        if (!name[c]) return 1;
+    }
+    return 1;
 }
 
-static s32 read_native_pad(void *G, void *pad_read, s32 pad_h, u8 *pbuf) {
+/*
+ * Append .nes/.rom entries from dir into roms[]. Returns new count.
+ * Deduplicates by filename. dir must be a path ending with '/'.
+ */
+static int scan_rom_directory(void *G, void *kopen, void *kclose,
+                              void *getdents, void *mmap, void *munmap,
+                              const char *dir, struct rom_entry *roms,
+                              int rom_count, int max_roms) {
+    if (!kopen || !getdents || !roms || rom_count >= max_roms) return rom_count;
+    s32 dfd = (s32)NC(G, kopen, (u64)dir, 0x20000, 0, 0, 0, 0);
+    if (dfd < 0) return rom_count;
+
+    u8 *dbuf = 0;
+    if (mmap)
+        dbuf = (u8 *)NC(G, mmap, 0, 0x2000, 3, 0x1002, (u64)-1, 0);
+    if (!dbuf || (s64)dbuf == -1) {
+        if (kclose) NC(G, kclose, (u64)dfd, 0, 0, 0, 0, 0);
+        return rom_count;
+    }
+
+    for (;;) {
+        s32 nread = (s32)NC(G, getdents, (u64)dfd, (u64)dbuf, 0x2000, 0, 0, 0);
+        if (nread <= 0) break;
+        int off = 0;
+        while (off < nread && rom_count < max_roms) {
+            u16 reclen = *(u16 *)(dbuf + off + 4);
+            u8 namlen  = *(u8 *)(dbuf + off + 7);
+            char *name = (char *)(dbuf + off + 8);
+            if (reclen == 0) break;
+            if (namlen > 0 && is_rom_file(name)) {
+                int dup = 0;
+                for (int j = 0; j < rom_count; j++) {
+                    if (rom_name_eq(&roms[j], name)) { dup = 1; break; }
+                }
+                if (!dup) {
+                    int k = 0;
+                    while (name[k] && k < 47) {
+                        roms[rom_count].filename[k] = name[k];
+                        k++;
+                    }
+                    roms[rom_count].filename[k] = '\0';
+                    extract_rom_name(name, roms[rom_count].display, MAX_NAME);
+                    rom_count++;
+                }
+            }
+            off += reclen;
+        }
+        if (rom_count >= max_roms) break;
+    }
+
+    if (munmap) NC(G, munmap, (u64)dbuf, 0x2000, 0, 0, 0, 0);
+    if (kclose) NC(G, kclose, (u64)dfd, 0, 0, 0, 0, 0);
+    return rom_count;
+}
+
+/*
+ * Rebuild the library from disk. Prefers ROM_DIR; falls back to /savedata0/.
+ * *rom_dir_out is updated to the directory used for path joins when loading.
+ * Returns the new entry count.
+ */
+static int rescan_rom_library(void *G, void *kopen, void *kclose,
+                              void *getdents, void *mmap, void *munmap,
+                              struct rom_entry *roms, int max_roms,
+                              const char **rom_dir_out) {
+    if (!roms || max_roms <= 0) return 0;
+
+    int count = 0;
+    const char *dir = ROM_DIR;
+
+    /* Full rebuild so deleted files disappear and new ones appear. */
+    for (int i = 0; i < max_roms; i++) {
+        roms[i].filename[0] = 0;
+        roms[i].display[0] = 0;
+    }
+
+    count = scan_rom_directory(G, kopen, kclose, getdents, mmap, munmap,
+                               ROM_DIR, roms, 0, max_roms);
+    if (count == 0) {
+        dir = "/savedata0/";
+        count = scan_rom_directory(G, kopen, kclose, getdents, mmap, munmap,
+                                   dir, roms, 0, max_roms);
+    }
+
+    if (count == 0 && kopen && kclose) {
+        s32 tfd = (s32)NC(G, kopen, (u64)"/savedata0/nes.rom", 0, 0, 0, 0, 0);
+        if (tfd >= 0) {
+            NC(G, kclose, (u64)tfd, 0, 0, 0, 0, 0);
+            dir = "/savedata0/";
+            const char *fn = "nes.rom";
+            int k = 0;
+            while (fn[k]) {
+                roms[0].filename[k] = fn[k];
+                k++;
+            }
+            roms[0].filename[k] = '\0';
+            extract_rom_name(fn, roms[0].display, MAX_NAME);
+            count = 1;
+        }
+    }
+
+    if (rom_dir_out) *rom_dir_out = dir;
+    return count;
+}
+
+/*
+ * Decode DualSense → NES buttons + level meta (not edge).
+ * Cross=A, Circle=B, Square=turbo A, Triangle=turbo B,
+ * Create=Select, Options=Start, L2/R2=save/load (edge later),
+ * L1=library, R1=settings, L3+R3=reset.
+ * Meta no longer clobber NES bits (old L1/L2/R2 bug).
+ */
+static void ds_decode(u32 b, u8 *nes_out, u8 *meta_out, u8 *turbo_out) {
+    u8 n = 0, m = 0, t = 0;
+    if (b & 0x00004000) n |= 0x01; /* CROSS  → A */
+    if (b & 0x00002000) n |= 0x02; /* CIRCLE → B */
+    if (b & 0x00000001) n |= 0x04; /* CREATE → Select */
+    if (b & 0x00100000) n |= 0x04; /* TOUCH  → Select */
+    if (b & 0x00000008) n |= 0x08; /* OPTIONS → Start */
+    if (b & 0x00000010) n |= 0x10; /* UP */
+    if (b & 0x00000040) n |= 0x20; /* DOWN */
+    if (b & 0x00000080) n |= 0x40; /* LEFT */
+    if (b & 0x00000020) n |= 0x80; /* RIGHT */
+
+    if (b & 0x00008000) t |= 0x01; /* SQUARE    → Turbo A */
+    if (b & 0x00001000) t |= 0x02; /* TRIANGLE  → Turbo B */
+
+    if (b & 0x00000100) m |= META_SAVE;     /* L2 */
+    if (b & 0x00000200) m |= META_LOAD;     /* R2 */
+    if (b & 0x00000800) m |= META_SETTINGS; /* R1 */
+    if (b & 0x00000400) m |= META_LIBRARY;  /* L1 */
+    /* L3 (0x2) + R3 (0x4) held together → soft reset */
+    if ((b & 0x00000006) == 0x00000006) m |= META_RESET;
+
+    *nes_out = n;
+    *meta_out = m;
+    *turbo_out = t;
+}
+
+/* Apply turbo fire onto NES A/B using host frame counter. */
+static u8 apply_turbo(u8 nes, u8 turbo, u32 frame, u8 turbo_rate_idx) {
+    if (turbo_rate_idx > 3) turbo_rate_idx = 1;
+    u8 half = turbo_half[turbo_rate_idx];
+    int on = ((frame / half) & 1) != 0;
+    if ((turbo & 0x01) && on) nes |= 0x01;
+    if ((turbo & 0x02) && on) nes |= 0x02;
+    return nes;
+}
+
+static int read_native_pad(void *G, void *pad_read, s32 pad_h, u8 *pbuf,
+                           u8 *nes_out, u8 *meta_out, u8 *turbo_out) {
+    if (nes_out) *nes_out = 0;
+    if (meta_out) *meta_out = 0;
+    if (turbo_out) *turbo_out = 0;
     if (pad_h < 0 || !pad_read) return -1;
     for (int i = 0; i < 128; i++) pbuf[i] = 0;
     s32 n = (s32)NC(G, pad_read, (u64)pad_h, (u64)pbuf, 1, 0, 0, 0);
     if (n <= 0 || (u32)n >= 0x80000000) return -1;
     u32 raw = *(u32 *)pbuf;
     if (raw & 0x80000000) return -1;
-    return (s32)ds_to_nes(raw & 0x001FFFFF);
+    ds_decode(raw & 0x001FFFFF, nes_out, meta_out, turbo_out);
+    return 1;
+}
+
+static void soft_reset_nes(struct NES *nes) {
+    nes->a = 0;
+    nes->x = 0;
+    nes->y = 0;
+    nes->sp = 0xFD;
+    nes->flags = F_I | F_U;
+    nes->prev_irq_inhibit = F_I;
+    nes->nmi_pending = 0;
+    nes->nmi_delay = 0;
+    nes->irq_pending = 0;
+    nes->apu_irq_pending = 0;
+    nes->pc = cpu_read16(nes, 0xFFFC);
+}
+
+static const char *scale_mode_name(int m) {
+    if (m == SCALE_MODE_PIXEL) return "PIXEL PERFECT";
+    if (m == SCALE_MODE_STRETCH) return "STRETCH";
+    if (m == SCALE_MODE_2X) return "2X";
+    if (m == SCALE_MODE_3X) return "3X";
+    if (m == SCALE_MODE_4X) return "4X";
+    return "?";
+}
+
+static const char *turbo_rate_name(int i) {
+    if (i == 0) return "30 HZ";
+    if (i == 1) return "20 HZ";
+    if (i == 2) return "15 HZ";
+    if (i == 3) return "10 HZ";
+    return "?";
 }
 
 __attribute__((section(".text._start")))
@@ -556,8 +641,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     void *recvfrom  = SYM(G, D, LIBKERNEL_HANDLE, "recvfrom");
     void *sendto    = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     void *accept    = SYM(G, D, LIBKERNEL_HANDLE, "accept");
-    void *poll      = SYM(G, D, LIBKERNEL_HANDLE, "poll");
-    void *setsockopt_fn = SYM(G, D, LIBKERNEL_HANDLE, "setsockopt");
     void *getsockname_fn = SYM(G, D, LIBKERNEL_HANDLE, "getsockname");
     void *getdents  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetdents");
     if (!getdents)   getdents = SYM(G, D, LIBKERNEL_HANDLE, "getdents");
@@ -566,9 +649,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u8 log_sa[16];
     for (int i = 0; i < 16; i++) log_sa[i] = ext->log_addr[i];
 
-    s32 web_fd   = (s32)ext->dbg[0];
-    u8 *web_page = (u8 *)ext->dbg[1];
-    u64 web_len  = ext->dbg[2];
     s32 userId   = (s32)ext->dbg[3];
     /* FTP listen FDs are created in Lua (sceNet/BSD via LuaC0re), not libkernel socket(). */
     s32 ftp_fd   = (s32)ext->dbg[4];
@@ -654,8 +734,16 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         for (int h = 0; h < 8; h++) NC(G, aud_close, (u64)h, 0,0,0,0,0);
 
     s32 audio_h = -1;
-    if (aud_open)
-        audio_h = (s32)NC(G, aud_open, 0xFF, 0, 0, SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (aud_open) {
+        /* Prefer the signed-in user; fall back to 0xFF (system / everyone). */
+        s32 aud_user = userId;
+        if (aud_user < 0) aud_user = 0xFF;
+        audio_h = (s32)NC(G, aud_open, (u64)aud_user, 0, 0,
+                           SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
+        if (audio_h < 0 && aud_user != 0xFF)
+            audio_h = (s32)NC(G, aud_open, 0xFF, 0, 0,
+                              SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
+    }
 
     s32 pad_mod = (s32)NC(G, load_mod, (u64)"libScePad.sprx", 0,0,0,0,0);
     void *pad_init_fn = SYM(G, D, pad_mod, "scePadInit");
@@ -689,9 +777,9 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         draw_centered(scr, 96, "FTP PORT 1337", COL_NORM);
         draw_centered(scr, 118, "UPLOAD .NES OR .ROM", COL_DIM);
         draw_centered(scr, 212, "WAITING FOR LAUNCHER", COL_DIM);
-        scale_to_framebuf((u32*)fbs[0], scr, 0);
-        scale_to_framebuf((u32*)fbs[1], scr, 0);
-        scale_to_framebuf((u32*)fbs[2], scr, 0);
+        scale_to_framebuf((u32*)fbs[0], scr, 0, SCALE_MODE_PIXEL);
+        scale_to_framebuf((u32*)fbs[1], scr, 0, SCALE_MODE_PIXEL);
+        scale_to_framebuf((u32*)fbs[2], scr, 0, SCALE_MODE_PIXEL);
         NC(G, vid_flip, (u64)video, 0, 1, 0, 0, 0);
 
         if (ftp_fd < 0 || ftp_data_fd < 0)
@@ -713,61 +801,35 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         if (rom_count > 0) udp_log(G, sendto, log_fd, log_sa, "FTP ROMs loaded\n");
     }
 
-    /* Scan filesystem for any additional ROMs not from FTP */
+    /* Merge filesystem ROMs (FTP list + on-disk scan). Prefer ROM_DIR. */
     if (kopen && getdents && (s64)roms != -1) {
-        s32 dfd = (s32)NC(G, kopen, (u64)ROM_DIR, 0x20000, 0, 0, 0, 0);
-        if (dfd < 0) {
-            rom_dir = "/savedata0/";
-            dfd = (s32)NC(G, kopen, (u64)"/savedata0/", 0x20000, 0, 0, 0, 0);
-        }
-        if (dfd >= 0) {
-            u8 *dbuf = (u8 *)NC(G, mmap, 0, 0x2000, 3, 0x1002, (u64)-1, 0);
-            if ((s64)dbuf != -1) {
-                for (;;) {
-                    s32 nread = (s32)NC(G, getdents, (u64)dfd, (u64)dbuf, 0x2000, 0, 0, 0);
-                    if (nread <= 0) break;
-                    int off = 0;
-                    while (off < nread && rom_count < MAX_ROMS) {
-                        u16 reclen = *(u16 *)(dbuf + off + 4);
-                        u8 namlen  = *(u8 *)(dbuf + off + 7);
-                        char *name = (char *)(dbuf + off + 8);
-                        if (reclen == 0) break;
-                        if (namlen > 0 && is_rom_file(name)) {
-                            /* skip if already registered by FTP */
-                            int dup = 0;
-                            for (int j = 0; j < rom_count; j++) {
-                                int match = 1;
-                                for (int c = 0; c < 47; c++) {
-                                    if (roms[j].filename[c] != name[c]) { match = 0; break; }
-                                    if (!name[c]) break;
-                                }
-                                if (match) { dup = 1; break; }
-                            }
-                            if (!dup) {
-                                int k = 0;
-                                while (name[k] && k < 47) { roms[rom_count].filename[k] = name[k]; k++; }
-                                roms[rom_count].filename[k] = '\0';
-                                extract_rom_name(name, roms[rom_count].display, MAX_NAME);
-                                rom_count++;
-                            }
-                        }
-                        off += reclen;
-                    }
-                    if (rom_count >= MAX_ROMS) break;
-                }
-                if (munmap) NC(G, munmap, (u64)dbuf, 0x2000, 0,0,0,0);
+        int before = rom_count;
+        rom_count = scan_rom_directory(G, kopen, kclose, getdents, mmap, munmap,
+                                       ROM_DIR, roms, rom_count, MAX_ROMS);
+        if (rom_count == before) {
+            /* ROM_DIR empty/missing — try savedata, keep FTP names if any. */
+            int n = scan_rom_directory(G, kopen, kclose, getdents, mmap, munmap,
+                                       "/savedata0/", roms, rom_count, MAX_ROMS);
+            if (n > rom_count) {
+                rom_count = n;
+                if (before == 0) rom_dir = "/savedata0/";
+            } else if (rom_count == 0) {
+                rom_dir = "/savedata0/";
             }
-            NC(G, kclose, (u64)dfd, 0,0,0,0,0);
         }
     }
 
-    if (rom_count == 0 && kopen && kclose) {
-        s32 tfd = (s32)NC(G, kopen, (u64)"/savedata0/nes.rom", 0,0,0,0,0);
+    if (rom_count == 0 && kopen && kclose && (s64)roms != -1) {
+        s32 tfd = (s32)NC(G, kopen, (u64)"/savedata0/nes.rom", 0, 0, 0, 0, 0);
         if (tfd >= 0) {
             rom_dir = "/savedata0/";
-            NC(G, kclose, (u64)tfd, 0,0,0,0,0);
+            NC(G, kclose, (u64)tfd, 0, 0, 0, 0, 0);
             const char *fn = "nes.rom";
-            int k = 0; while (fn[k]) { roms[0].filename[k] = fn[k]; k++; }
+            int k = 0;
+            while (fn[k]) {
+                roms[0].filename[k] = fn[k];
+                k++;
+            }
             roms[0].filename[k] = '\0';
             extract_rom_name(fn, roms[0].display, MAX_NAME);
             rom_count = 1;
@@ -776,70 +838,112 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     u32 total_frames = 0;
     int active = 0;
-    int has_web = (web_fd >= 0 && poll && accept);
-    int input_src = 0;
-    u8 web_pad = 0;
-    s32 web_client = -1;
+    /* Settings (stack — no writable statics in RX shellcode). */
+    u8 scale_mode = SCALE_MODE_PIXEL;
+    u8 turbo_rate = 1; /* 20 Hz default */
+    u8 prev_scale_mode = 0xFF;
 
     for (;;) {
         int selected = 0;
+        int cursor = 0, scroll = 0, mframe = 0, hold = 0;
+        u8 prev_nes = 0;
+        u8 meta_prev = 0;
+        int refresh_msg = 0;
 
-        if (rom_count > 0) {
-            int cursor = 0, scroll = 0, mframe = 0, hold = 0;
-            u8 prev_btn = 0;
-            int visible = 14;
-            if (visible > rom_count) visible = rom_count;
+        /* Library browser (also when empty — L1 rescans after new uploads). */
+        for (;;) {
+            u8 nes_btn = 0, meta_lvl = 0, turbo = 0;
+            s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf, &nes_btn, &meta_lvl, &turbo);
+            if (nb < 0) {
+                nes_btn = 0;
+                meta_lvl = 0;
+                turbo = 0;
+            }
 
-            for (;;) {
-                u8 btn = 0;
+            /*
+             * Meta is edge-filtered: held L1/L2/R1/R2 fire once only
+             * (same class of bug as the old trigger clobber).
+             */
+            u8 meta_edge = (u8)(meta_lvl & ~meta_prev);
+            meta_prev = meta_lvl;
 
-                u8 wb = 0; int web_got = 0;
-                if (has_web) {
-                    web_got = web_handle(G, poll, accept, recvfrom, sendto, kclose,
-                                        setsockopt_fn, web_fd, &web_client, web_page, web_len, &wb);
-                    if (web_got) web_pad = wb;
-                }
+            /* Library: R1 exits (in-game R1 opens Settings — also edge). */
+            if (meta_edge & (META_EXIT | META_SETTINGS)) goto done;
 
-                s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf);
+            u8 pressed = (u8)(nes_btn & ~prev_nes);
+            int do_refresh = 0;
+            if ((s64)roms != -1) {
+                if (meta_edge & META_LIBRARY) do_refresh = 1;
+            }
 
-                if (input_src == 0) {
-                    if (nb > 0 && nb < CMD_STATE_LOAD) {
-                        input_src = 1;  btn = (u8)nb;
-                        udp_log(G, sendto, log_fd, log_sa, "Input: native pad\n");
+            if (do_refresh) {
+                char keep[48];
+                int ki = 0;
+                if (rom_count > 0 && cursor >= 0 && cursor < rom_count) {
+                    while (roms[cursor].filename[ki] && ki < 47) {
+                        keep[ki] = roms[cursor].filename[ki];
+                        ki++;
                     }
-                    else if (web_got && web_pad > 0 && web_pad < CMD_STATE_LOAD) {
-                        input_src = 2; btn = web_pad;
-                        udp_log(G, sendto, log_fd, log_sa, "Input: web controller\n");
-                    }
-                    if (web_got && web_pad >= CMD_STATE_LOAD) btn = web_pad;
-                    if (nb >= CMD_STATE_LOAD) btn = (u8)nb;
-                } else if (input_src == 1) {
-                    if (nb >= 0) btn = (u8)nb;
-                } else {
-                    btn = web_pad;
                 }
+                keep[ki] = 0;
 
-                if (btn >= CMD_STATE_LOAD) web_pad = 0;
-                if (btn == CMD_EXIT) goto done;
-                if (btn == CMD_STATE_LOAD || btn == CMD_STATE_SAVE) btn = 0;
-
-                u8 pressed = btn & ~prev_btn;
+                rom_count = rescan_rom_library(G, kopen, kclose, getdents,
+                                               mmap, munmap, roms, MAX_ROMS,
+                                               &rom_dir);
+                cursor = 0;
+                if (keep[0] && rom_count > 0) {
+                    for (int j = 0; j < rom_count; j++) {
+                        if (rom_name_eq(&roms[j], keep)) {
+                            cursor = j;
+                            break;
+                        }
+                    }
+                }
+                scroll = 0;
+                if (cursor >= 14) scroll = cursor - 13;
+                refresh_msg = 90;
+                hold = 0;
+                udp_log(G, sendto, log_fd, log_sa, "ROM list refreshed\n");
+            } else if (rom_count > 0) {
                 int move = 0;
-                if (btn & 0x10) { hold++; if ((pressed & 0x10) || (hold > 12 && hold % 4 == 0)) move = -1; }
-                else if (btn & 0x20) { hold++; if ((pressed & 0x20) || (hold > 12 && hold % 4 == 0)) move = 1; }
-                else hold = 0;
+                if (nes_btn & 0x10) {
+                    hold++;
+                    if ((pressed & 0x10) || (hold > 12 && hold % 4 == 0)) move = -1;
+                } else if (nes_btn & 0x20) {
+                    hold++;
+                    if ((pressed & 0x20) || (hold > 12 && hold % 4 == 0)) move = 1;
+                } else {
+                    hold = 0;
+                }
 
                 if (move) {
                     cursor += move;
                     if (cursor < 0) cursor = rom_count - 1;
                     if (cursor >= rom_count) cursor = 0;
+                    int visible = rom_count < 14 ? rom_count : 14;
                     if (cursor < scroll) scroll = cursor;
                     if (cursor >= scroll + visible) scroll = cursor - visible + 1;
                 }
-                if ((pressed & 0x01) || (pressed & 0x08)) { selected = cursor; break; }
-                prev_btn = btn;
+                /* Cross (A) or Start → play */
+                if ((pressed & 0x01) || (pressed & 0x08)) {
+                    selected = cursor;
+                    prev_nes = nes_btn;
+                    break;
+                }
+            } else {
+                hold = 0;
+            }
+            prev_nes = nes_btn;
+            (void)turbo;
 
-                u8 *scr = nes->screen;
+            u8 *scr = nes->screen;
+            if (rom_count > 0) {
+                int visible = rom_count < 14 ? rom_count : 14;
+                if (cursor >= rom_count) cursor = rom_count - 1;
+                if (cursor < 0) cursor = 0;
+                if (scroll > cursor) scroll = cursor;
+                if (scroll < 0) scroll = 0;
+
                 draw_menu_shell(scr, "SELECT A GAME");
                 draw_str(scr, 16, 42, "LIBRARY", COL_HEAD);
                 int cx = 170;
@@ -874,41 +978,44 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                     draw_str_limit(scr, 70, iy, roms[idx].display, 20, sel ? COL_SEL : COL_NORM);
                 }
 
-                draw_str_limit(scr, 16, 212, roms[cursor].display, 28, COL_HEAD);
-                draw_str(scr, 16, 224, "A/START PLAY", COL_SEL);
-                draw_str(scr, 144, 224, "R1/TAB EXIT", COL_DIM);
-
-                scale_to_framebuf((u32*)fbs[active], scr, 0);
-                NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
-                if (eq && wait_eq) {
-                    u8 evt[64]; s32 cnt = 0;
-                    NC(G, wait_eq, eq, (u64)evt, 1, (u64)&cnt, 0, 0);
+                if (refresh_msg > 0) {
+                    draw_centered(scr, 212, "LIST REFRESHED", COL_SEL);
+                    refresh_msg--;
+                } else {
+                    draw_str_limit(scr, 16, 212, roms[cursor].display, 28, COL_HEAD);
                 }
-                active = next_fb(active);
-                mframe++;
-                total_frames++;
-            }
-        } else {
-            for (int f = 0; f < 300; f++) {
-                u8 *scr = nes->screen;
+                draw_str(scr, 12, 224, "X PLAY", COL_SEL);
+                draw_str(scr, 76, 224, "L1 REFRESH", COL_NORM);
+                draw_str(scr, 176, 224, "R1 EXIT", COL_DIM);
+            } else {
                 draw_menu_shell(scr, "ROM LIBRARY");
                 draw_box(scr, 24, 62, 208, 102, COL_LINE);
                 draw_rect(scr, 26, 64, 204, 98, COL_PANEL);
                 draw_centered(scr, 78, "NO ROMS FOUND", COL_BRAND);
                 draw_centered(scr, 102, "UPLOAD .NES OR .ROM", COL_NORM);
-                draw_centered(scr, 124, "FTP PORT 1337", COL_DIM);
+                draw_centered(scr, 124, "THEN PRESS L1", COL_SEL);
                 draw_centered(scr, 146, "OR USE /SAVEDATA0/", COL_DIM);
-                draw_centered(scr, 212, "RELAUNCH AFTER COPY", COL_DIM);
-                scale_to_framebuf((u32*)fbs[active], scr, 0);
-                NC(G, vid_flip, (u64)video, (u64)active, 1, (u64)f, 0, 0);
-                if (eq && wait_eq) {
-                    u8 evt[64]; s32 cnt = 0;
-                    NC(G, wait_eq, eq, (u64)evt, 1, (u64)&cnt, 0, 0);
+                if (refresh_msg > 0) {
+                    draw_centered(scr, 212, "STILL EMPTY", COL_DIM);
+                    refresh_msg--;
+                } else {
+                    draw_centered(scr, 212, "L1 REFRESH  R1 EXIT", COL_DIM);
                 }
-                active = next_fb(active);
             }
-            break;
+
+            scale_to_framebuf((u32*)fbs[active], scr, 0, SCALE_MODE_PIXEL);
+            NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
+            if (eq && wait_eq) {
+                u8 evt[64]; s32 cnt = 0;
+                NC(G, wait_eq, eq, (u64)evt, 1, (u64)&cnt, 0, 0);
+            }
+            active = next_fb(active);
+            mframe++;
+            total_frames++;
         }
+
+        if (rom_count <= 0 || selected < 0 || selected >= rom_count)
+            continue;
 
         char rom_path[96];
         { int pi = 0; const char *p = rom_dir;
@@ -1020,7 +1127,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 draw_centered(scr, 88, load_error ? load_error : "LOAD FAILED", COL_BRAND);
                 draw_str_limit(scr, 24, 116, roms[selected].display, 26, COL_NORM);
                 draw_centered(scr, 140, "RETURNING TO LIBRARY", COL_DIM);
-                scale_to_framebuf((u32*)fbs[active], scr, 0);
+                scale_to_framebuf((u32*)fbs[active], scr, 0, SCALE_MODE_PIXEL);
                 NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
                 if (eq && wait_eq) {
                     u8 evt[64]; s32 cnt = 0;
@@ -1050,63 +1157,204 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             udp_log(G, sendto, log_fd, log_sa, mbuf);
         }
 
-        apu_prime(nes, 2);
+        apu_prime(nes, AUDIO_PRIME_BUFS);
 
         u32 frame = 0;
         int pal_acc = 60;
         int back_to_menu = 0;
         const char *state_msg = 0;
         int state_msg_frames = 0;
+        int in_settings = 0;
+        int set_cursor = 0;
+        int set_hold = 0;
+        u8 meta_prev_g = 0;
+        u8 prev_nes_g = 0;
+        /* Settings rows: 0 scale, 1 turbo, 2 save, 3 load, 4 reset, 5 library, 6 exit */
+        enum { SET_N = 7 };
 
         for (;;) {
-            u8 wb = 0; int web_got = 0;
-            if (has_web) {
-                web_got = web_handle(G, poll, accept, recvfrom, sendto, kclose,
-                                    setsockopt_fn, web_fd, &web_client, web_page, web_len, &wb);
-                if (web_got) web_pad = wb;
+            u8 nes_btn = 0, meta_lvl = 0, turbo = 0;
+            s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf, &nes_btn, &meta_lvl, &turbo);
+            if (nb < 0) {
+                nes_btn = 0;
+                meta_lvl = 0;
+                turbo = 0;
             }
 
-            s32 nb = read_native_pad(G, pad_read, pad_h, pad_buf);
+            /* Rising edge only — held R1/L2/R2 do not re-fire every frame. */
+            u8 meta_edge = (u8)(meta_lvl & ~meta_prev_g);
+            meta_prev_g = meta_lvl;
 
-            if (input_src == 0) {
-                if (nb > 0 && nb < CMD_STATE_LOAD) {
-                    input_src = 1; nes->pad_state = (u8)nb;
-                    udp_log(G, sendto, log_fd, log_sa, "Input: native pad\n");
+            u8 pressed = (u8)(nes_btn & ~prev_nes_g);
+            prev_nes_g = nes_btn;
+
+            /* —— Settings menu (paused) —— */
+            if (in_settings) {
+                int move = 0;
+                if (nes_btn & 0x10) {
+                    set_hold++;
+                    if ((pressed & 0x10) || (set_hold > 12 && set_hold % 4 == 0)) move = -1;
+                } else if (nes_btn & 0x20) {
+                    set_hold++;
+                    if ((pressed & 0x20) || (set_hold > 12 && set_hold % 4 == 0)) move = 1;
+                } else {
+                    set_hold = 0;
                 }
-                else if (web_got && web_pad > 0 && web_pad < CMD_STATE_LOAD) {
-                    input_src = 2; nes->pad_state = web_pad;
-                    udp_log(G, sendto, log_fd, log_sa, "Input: web controller\n");
+                if (move) {
+                    set_cursor += move;
+                    if (set_cursor < 0) set_cursor = SET_N - 1;
+                    if (set_cursor >= SET_N) set_cursor = 0;
                 }
-                if (web_got && web_pad >= CMD_STATE_LOAD) nes->pad_state = web_pad;
-                if (nb >= CMD_STATE_LOAD) nes->pad_state = (u8)nb;
-            } else if (input_src == 1) {
-                if (nb >= 0) nes->pad_state = (u8)nb;
-            } else {
-                nes->pad_state = web_pad;
+
+                int act = 0, adj = 0;
+                if (pressed & 0x01) act = 1;           /* Cross = confirm */
+                if (pressed & 0x02) {                   /* Circle = back */
+                    in_settings = 0;
+                    act = 0;
+                }
+                if (pressed & 0x40) adj = -1;           /* Left */
+                if (pressed & 0x80) adj = 1;            /* Right */
+                /* R1 rising edge closes (hold does nothing — no open/close spam). */
+                if (meta_edge & META_SETTINGS) in_settings = 0;
+
+                if (act || adj) {
+                    if (set_cursor == 0) {
+                        if (adj || act) {
+                            if (adj < 0) {
+                                if (scale_mode == 0) scale_mode = SCALE_MODE_COUNT - 1;
+                                else scale_mode--;
+                            } else {
+                                scale_mode++;
+                                if (scale_mode >= SCALE_MODE_COUNT) scale_mode = 0;
+                            }
+                            prev_scale_mode = 0xFF; /* force letterbox clear */
+                        }
+                    } else if (set_cursor == 1) {
+                        if (adj || act) {
+                            if (adj < 0) {
+                                if (turbo_rate == 0) turbo_rate = 3;
+                                else turbo_rate--;
+                            } else {
+                                turbo_rate++;
+                                if (turbo_rate > 3) turbo_rate = 0;
+                            }
+                        }
+                    } else if (act) {
+                        if (set_cursor == 2) {
+                            int ok = save_state(nes, state_buf, G, kopen, kwrite, kclose, state_path);
+                            state_msg = ok ? "STATE SAVED" : "SAVE FAILED";
+                            state_msg_frames = 60;
+                            in_settings = 0;
+                        } else if (set_cursor == 3) {
+                            int ok = load_state(nes, state_buf, G, kopen, kread, kclose, state_path);
+                            state_msg = ok ? "STATE LOADED" : "LOAD FAILED";
+                            state_msg_frames = 60;
+                            if (ok) apu_prime(nes, AUDIO_PRIME_BUFS);
+                            in_settings = 0;
+                        } else if (set_cursor == 4) {
+                            soft_reset_nes(nes);
+                            state_msg = "RESET";
+                            state_msg_frames = 60;
+                            in_settings = 0;
+                        } else if (set_cursor == 5) {
+                            save_sram(nes, G, kopen, kwrite, kclose, save_path);
+                            back_to_menu = 1;
+                            break;
+                        } else if (set_cursor == 6) {
+                            save_sram(nes, G, kopen, kwrite, kclose, save_path);
+                            goto done;
+                        }
+                    }
+                }
+
+                /* Still emit silence-ish audio cadence while paused. */
+                if (nes->rom_loaded) apu_flush(nes);
+
+                /* Draw last game frame under a panel. */
+                {
+                    u8 *scr = nes->screen;
+                    draw_rect(scr, 20, 28, 216, 168, COL_PANEL);
+                    draw_box(scr, 18, 26, 220, 172, COL_LINE);
+                    draw_centered(scr, 34, "SETTINGS", COL_BRAND);
+
+                    const char *labels[7];
+                    labels[0] = "SCALE";
+                    labels[1] = "TURBO";
+                    labels[2] = "SAVE STATE";
+                    labels[3] = "LOAD STATE";
+                    labels[4] = "RESET GAME";
+                    labels[5] = "ROM LIBRARY";
+                    labels[6] = "EXIT EMU";
+
+                    for (int i = 0; i < SET_N; i++) {
+                        int iy = 52 + i * 16;
+                        int sel = (i == set_cursor);
+                        u8 col = sel ? COL_SEL : COL_NORM;
+                        if (sel) {
+                            draw_rect(scr, 28, iy - 2, 200, 14, COL_PANEL_2);
+                            draw_char(scr, 32, iy, '>', COL_CUR);
+                        }
+                        draw_str(scr, 48, iy, labels[i], col);
+                        if (i == 0)
+                            draw_str_limit(scr, 120, iy, scale_mode_name(scale_mode), 14, col);
+                        if (i == 1)
+                            draw_str_limit(scr, 120, iy, turbo_rate_name(turbo_rate), 10, col);
+                    }
+                    draw_centered(scr, 180, "X OK  O BACK  L/R VALUE", COL_DIM);
+                }
+
+                if (prev_scale_mode != scale_mode) {
+                    clear_fb((u32*)fbs[0]);
+                    clear_fb((u32*)fbs[1]);
+                    clear_fb((u32*)fbs[2]);
+                    prev_scale_mode = scale_mode;
+                }
+                scale_to_framebuf((u32*)fbs[active], nes->screen, 0, scale_mode);
+                NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
+                if (eq && wait_eq) {
+                    u8 evt[64]; s32 cnt = 0;
+                    NC(G, wait_eq, eq, (u64)evt, 1, (u64)&cnt, 0, 0);
+                }
+                active = next_fb(active);
+                total_frames++;
+                ext->frame_count = total_frames;
+                continue;
             }
 
-            if (nes->pad_state >= CMD_STATE_LOAD) web_pad = 0;
-            if (nes->pad_state == CMD_EXIT) {
+            /* —— In-game meta (edge only) —— */
+            if (meta_edge & META_EXIT) {
                 save_sram(nes, G, kopen, kwrite, kclose, save_path);
                 goto done;
             }
-            if (nes->pad_state == CMD_MENU) {
+            if (meta_edge & META_LIBRARY) {
                 save_sram(nes, G, kopen, kwrite, kclose, save_path);
-                back_to_menu = 1; nes->pad_state = 0; break;
+                back_to_menu = 1;
+                break;
             }
-            if (nes->pad_state == CMD_STATE_SAVE) {
+            if (meta_edge & META_SETTINGS) {
+                in_settings = 1;
+                set_cursor = 0;
+                set_hold = 0;
+                continue;
+            }
+            if (meta_edge & META_RESET) {
+                soft_reset_nes(nes);
+                state_msg = "RESET";
+                state_msg_frames = 60;
+            }
+            if (meta_edge & META_SAVE) {
                 int ok = save_state(nes, state_buf, G, kopen, kwrite, kclose, state_path);
-                udp_log(G, sendto, log_fd, log_sa, ok ? "State saved\n" : "State save failed\n");
                 state_msg = ok ? "STATE SAVED" : "SAVE FAILED";
                 state_msg_frames = 60;
-                nes->pad_state = 0;
-            } else if (nes->pad_state == CMD_STATE_LOAD) {
+            }
+            if (meta_edge & META_LOAD) {
                 int ok = load_state(nes, state_buf, G, kopen, kread, kclose, state_path);
-                udp_log(G, sendto, log_fd, log_sa, ok ? "State loaded\n" : "State load failed\n");
                 state_msg = ok ? "STATE LOADED" : "LOAD FAILED";
                 state_msg_frames = 60;
-                nes->pad_state = 0;
+                if (ok) apu_prime(nes, AUDIO_PRIME_BUFS);
             }
+
+            nes->pad_state = apply_turbo(nes_btn, turbo, frame, turbo_rate);
 
             int run_game = 1;
             if (nes->is_pal) {
@@ -1114,10 +1362,15 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 if (pal_acc >= 60) pal_acc -= 60; else run_game = 0;
             }
 
-            if (run_game) {
+            if (run_game)
                 run_frame(nes);
-                if (nes->rom_loaded) apu_flush(nes);
-            }
+            /*
+             * Always flush after a display tick. On PAL drop-frames no new
+             * samples are made, but any full grain left from the previous NES
+             * frame still needs to reach AudioOut before the vsync wait.
+             */
+            if (nes->rom_loaded)
+                apu_flush(nes);
             if (state_msg_frames > 0 && state_msg) {
                 draw_rect(nes->screen, 74, 4, 108, 14, COL_PANEL);
                 draw_box(nes->screen, 72, 2, 112, 18, COL_LINE);
@@ -1125,7 +1378,13 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 state_msg_frames--;
             }
 
-            scale_to_framebuf((u32*)fbs[active], nes->screen, nes->ppu_mask);
+            if (prev_scale_mode != scale_mode) {
+                clear_fb((u32*)fbs[0]);
+                clear_fb((u32*)fbs[1]);
+                clear_fb((u32*)fbs[2]);
+                prev_scale_mode = scale_mode;
+            }
+            scale_to_framebuf((u32*)fbs[active], nes->screen, nes->ppu_mask, scale_mode);
             NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
 
             if (eq && wait_eq) {
@@ -1159,12 +1418,6 @@ done:
 
     if (delete_eq && eq)
         NC(G, delete_eq, eq, 0,0,0,0,0);
-
-    if (web_client >= 0 && kclose)
-        NC(G, kclose, (u64)web_client, 0,0,0,0,0);
-
-    if (web_fd >= 0 && kclose)
-        NC(G, kclose, (u64)web_fd, 0,0,0,0,0);
 
     if (munmap) {
         if ((s64)nes != -1)

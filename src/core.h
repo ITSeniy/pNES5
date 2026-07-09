@@ -24,13 +24,40 @@ typedef signed char    s8;
 
 #define NES_W  256
 #define NES_H  240
+/* Legacy defaults (scale mode 0 = pixel-perfect max integer ≈ 4× on 1080p). */
 #define SCALE  4
 #define OFF_X  ((SCR_W - NES_W * SCALE) / 2)
 #define OFF_Y  ((SCR_H - NES_H * SCALE) / 2)
 
+/* Host display scale modes (settings menu). */
+#define SCALE_MODE_PIXEL   0  /* max integer fit — pixel perfect */
+#define SCALE_MODE_STRETCH 1  /* nearest-neighbour fill 1920×1080 */
+#define SCALE_MODE_2X      2
+#define SCALE_MODE_3X      3
+#define SCALE_MODE_4X      4
+#define SCALE_MODE_COUNT   5
+
 #define SAMPLE_RATE     48000
-#define SAMPLES_PER_BUF 256
+/*
+ * Grain size for sceAudioOutOpen / Output. 256 (~5.3 ms) underruns easily when
+ * the main loop is vsync-locked; 512 (~10.7 ms) is far more stable on PS5.
+ */
+#define SAMPLES_PER_BUF 512
+/* Silence buffers queued before gameplay so the AudioOut ring has headroom. */
+#define AUDIO_PRIME_BUFS 4
 #define AUDIO_S16_STEREO 1
+/*
+ * Sample-clock divisors for the APU → 48 kHz resampler (see apu_step).
+ *
+ * NTSC true master is 1 789 773 Hz (~60.0988 fps). Locked to a 60 Hz display
+ * that only yields ~798.7 samples/frame and slowly drains the audio queue
+ * (~80 samples/s short) → crackling underruns. 1 786 830 = 29780.5×60 emits
+ * ~800 samples/frame at 60 Hz host (pitch +0.17%, inaudible).
+ *
+ * PAL already averages ~48 kHz when the loop runs 50 NES frames per 60 flips.
+ */
+#define NTSC_SAMPLE_DIV 1786830
+#define PAL_SAMPLE_DIV  1662607
 
 __attribute__((naked))
 static u64 native_call(void *gadget, void *fn,

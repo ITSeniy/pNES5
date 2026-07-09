@@ -13,9 +13,8 @@ First emulator in the project
 - PPU with scrolling, sprites, sprite 0 hit
 - APU with 48kHz output
 - DualSense native pad support
-- Web-based touch/WebHID controller
 - Built-in FTP server for ROM upload
-- ROM picker menu
+- ROM picker menu + settings (scale, turbo, states)
 - Save states
 - NTSC/PAL
 
@@ -172,39 +171,40 @@ ROM picker:
 
 - **D-Pad** — navigate
 - **Cross / Start** — launch
-- **L1** — back to menu
-- **R1** — exit
+- **L1** — refresh ROM list from disk (after FTP or manual copy)
+- **R1** — exit emulator
 
 In-game:
 
-| DualSense        | NES    |
-| ---------------- | ------ |
-| Cross            | A      |
-| Square           | B      |
-| Triangle         | Select |
-| Circle / Options | Start  |
-| D-Pad            | D-Pad  |
-| L2               | Save state |
-| R2               | Load state |
-| L1               | Menu |
-| R1               | Exit |
+| DualSense | Action |
+| --------- | ------ |
+| Cross | NES **A** |
+| Circle | NES **B** |
+| Square | **Turbo A** |
+| Triangle | **Turbo B** |
+| Create / Touch pad | Select |
+| Options | Start |
+| D-Pad | D-Pad |
+| L2 | Save state (edge — no repeat while held) |
+| R2 | Load state (edge) |
+| L1 | ROM library |
+| R1 | **Settings menu** |
+| L3 + R3 | Soft reset |
 
-### Input Sources
+### Settings menu (R1)
 
-Two options: **native DualSense** or **web controller** (open `http://<PS5_IP>:9030` on your phone/PC)
+- **Scale** — Pixel Perfect (default integer max fit), Stretch, 2× / 3× / 4×
+- **Turbo** rate — 30 / 20 / 15 / 10 Hz
+- Save / Load state, Reset game, ROM library, Exit
 
-The input source locks on the first button press and stays for the entire emulator session. You can't switch mid-session — you need to relaunch the emulator to change input method.
+Navigate with D-Pad; Cross confirms; Circle / R1 closes; Left/Right change values.
 
-The web controller supports touch buttons, Gamepad API, and DualSense WebHID (Chrome/Edge, USB or BT).
-The web keyboard shortcuts are **F5** for save state, **F9** for load state, **Esc** for menu, and **Tab** for exit.
+Input is **native DualSense only**.
 
 ## TODO
 
-- [ ] More mappers (VRC2/4/6, MMC5, Namco 163, 79/113, …)
+- [ ] More mappers (VRC2/4/6, MMC5, Namco 163, …)
 - [ ] Cycle-accurate MMC3 A12 during rendering
-- [ ] SNES emulator
-- [ ] Game Boy / GBC emulator
-- [ ] maybe more emulators lets see...
 
 ## Credits
 

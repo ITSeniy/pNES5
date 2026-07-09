@@ -467,7 +467,7 @@ int ftp_serve(s32 srv_fd, s32 data_listen_fd,
     f.data_listen_fd = data_listen_fd;
     f.ctrl_fd = -1; f.pasv_fd = -1;
 
-    /* Prefer sceKernelClose (same as main.c for web sockets); fall back to close. */
+    /* Prefer sceKernelClose (same as main.c); fall back to close. */
     f.close_fn = kclose;
     if (!f.close_fn)
         f.close_fn = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose");
