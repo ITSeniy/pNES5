@@ -30,7 +30,7 @@ static void copy_scroll_y(struct NES *nes) {
  * rendering mid-line after the line was drawn with rendering off.
  */
 static void ppu_eval_sp0_overlap(struct NES *nes, int y) {
-    u8 bg_opaque[NES_W];
+    u8 *bg_opaque = nes->bg_opaque;
     for (int x = 0; x < NES_W; x++) bg_opaque[x] = 0;
 
     u16 v = nes->ppu_line_v;
@@ -392,10 +392,8 @@ static void step_cpu_apu_until(struct NES *nes, int target,
 
 int render_scanline(struct NES *nes, int y) {
     u8 *line = &nes->screen[y * NES_W];
-    /*
-     * Stack (not static): JIT shellcode is RX; static writes fault on PS.
-     */
-    u8 bg_opaque[NES_W];
+    /* Heap buffer in struct NES — see nes.h (no RX static, no exploit stack). */
+    u8 *bg_opaque = nes->bg_opaque;
     for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
 
     /*

@@ -99,6 +99,12 @@ struct NES {
      * Rendering Flag Behavior). Lives in NES (heap), never shellcode static.
      */
     u8  sp0_overlap;
+    /*
+     * Per-line BG opacity for spr0. Must be on the heap NES object: shellcode
+     * is mapped RX (W^X), so file-scope statics fault; the exploit stack is
+     * also too tight for 256-byte temps in render paths.
+     */
+    u8  bg_opaque[NES_W];
     /* Visible scanline index while its CPU runs, else -1. */
     s16 ppu_cur_scanline;
     /* v used for the current visible line (before inc_scroll_y). */
