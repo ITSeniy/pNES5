@@ -247,10 +247,28 @@ static void begin_vblank_suppressed(struct NES *nes) {
     nes->nmi_in_instr = 0;
 }
 
-static void end_vblank(struct NES *nes) {
-    /* Same instant as pre-render: clear VBlank + sprite0 + overflow. */
+/*
+ * Clear VBlank flags. clr_phase = sl_acc at the clear line (-1 = unknown).
+ *
+ * NMI-at-VBL-end: $2000 enable is ~4 CPU before clear while nmi_delay is still
+ * set, so without a cancel NMI is taken after clear for A=0..3 (4×$01).
+ * AccuracyCoin wants 3×$01. A=0 and A=3 share PPU phase but clear on different
+ * CPU-cycle alignments; drop the un-taken delayed edge when the combined
+ * CPU+PPU alignment is the late slot: (cycles + phase) % 3 == 2.
+ */
+static void end_vblank_ph(struct NES *nes, int clr_phase) {
     nes->ppu_status &= ~0xE0;
     nes->in_vblank = 0;
+    if (nes->nmi_delay && clr_phase >= 0
+        && ((nes->cycles + clr_phase) % 3) == 2) {
+        nes->nmi_pending = 0;
+        nes->nmi_delay = 0;
+        nes->nmi_in_instr = 0;
+    }
+}
+
+static void end_vblank(struct NES *nes) {
+    end_vblank_ph(nes, -1);
 }
 
 /*
@@ -275,7 +293,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         *nmi_done = 1;
     }
     if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
-        end_vblank(nes);
+        end_vblank_ph(nes, vbl_phase);
         *clr_done = 1;
     }
     while (nes->cycles < target) {
@@ -331,7 +349,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         }
         if (clr_done && !*clr_done && clr_cycle >= 0
             && start < clr_cycle && start + hint >= clr_cycle) {
-            end_vblank(nes);
+            end_vblank_ph(nes, vbl_phase);
             *clr_done = 1;
         }
 
@@ -358,7 +376,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             *nmi_done = 1;
         }
         if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
-            end_vblank(nes);
+            end_vblank_ph(nes, vbl_phase);
             *clr_done = 1;
         }
     }
@@ -367,7 +385,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         *nmi_done = 1;
     }
     if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
-        end_vblank(nes);
+        end_vblank_ph(nes, vbl_phase);
         *clr_done = 1;
     }
 }
@@ -579,9 +597,9 @@ void run_frame(struct NES *nes) {
         else if (y == 241 && !vblank_nmi_done)
             step_cpu_apu_until(nes, target, sl_start, &vblank_nmi_done, -1, 0, sl_acc);
         else if (y == sl_vbl_last)
-            step_cpu_apu_until(nes, target, -1, 0, target, &vblank_clr_done, 0);
+            step_cpu_apu_until(nes, target, -1, 0, target, &vblank_clr_done, sl_acc);
         else if (y == sl_pre && !vblank_clr_done)
-            step_cpu_apu_until(nes, target, -1, 0, sl_start, &vblank_clr_done, 0);
+            step_cpu_apu_until(nes, target, -1, 0, sl_start, &vblank_clr_done, sl_acc);
         else
             step_cpu_apu_until(nes, target, -1, 0, -1, 0, 0);
     }

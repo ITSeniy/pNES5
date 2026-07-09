@@ -125,6 +125,9 @@ static void dump50(struct NES *nes, const char *tag) {
     printf("%s $50:", tag);
     for (int i = 0; i < 10; i++) printf(" %02X", nes->ram[0x50 + i]);
     printf("\n");
+    printf("%s $60:", tag);
+    for (int i = 0; i < 10; i++) printf(" %02X", nes->ram[0x60 + i]);
+    printf("\n");
 }
 
 static int run_one(const char *rom, u16 addr, const char *tag, const char *expect) {
