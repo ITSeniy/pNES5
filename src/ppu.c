@@ -1,0 +1,425 @@
+#include "nes.h"
+#include "mapper.h"
+#include "tables.h"
+
+static void inc_scroll_y(struct NES *nes) {
+    u16 v = nes->vram_addr;
+    if ((v & 0x7000) != 0x7000) { v += 0x1000; }
+    else {
+        v &= ~0x7000;
+        int cy = (v & 0x03E0) >> 5;
+        if (cy == 29) { cy = 0; v ^= 0x0800; }
+        else if (cy == 31) cy = 0;
+        else cy++;
+        v = (v & ~0x03E0) | (cy << 5);
+    }
+    nes->vram_addr = v;
+}
+
+static void copy_scroll_x(struct NES *nes) {
+    nes->vram_addr = (nes->vram_addr & 0xFBE0) | (nes->temp_addr & 0x041F);
+}
+
+static void copy_scroll_y(struct NES *nes) {
+    nes->vram_addr = (nes->vram_addr & 0x041F) | (nes->temp_addr & 0xFBE0);
+}
+
+static void step_cpu_apu(struct NES *nes) {
+    /*
+     * DMC timer: one tick per CPU cycle. Bus accesses tick during the instr;
+     * pad any leftover cycles so IFlagLatency DMA windows stay aligned.
+     * Open-bus DMASync uses dma_open_ttl so pad-time DMA requests are OK.
+     */
+    nes->dmc.ticks_exec = 0;
+    int before = nes->cycles;
+    cpu_step(nes);
+    int ran = nes->cycles - before;
+    if (ran > 0) {
+        while (nes->dmc.ticks_exec < ran)
+            dmc_tick(nes);
+        apu_step(nes, ran);
+        mapper_cpu_clock(nes, ran);
+        nes->total_cycles += ran;
+    }
+}
+
+static int cpu_next_cycles_hint(struct NES *nes) {
+    static const u8 cycles[256] = {
+        7,6,2,8,3,3,5,5,3,2,2,2,4,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+        6,6,2,8,3,3,5,5,4,2,2,2,4,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+        6,6,2,8,3,3,5,5,3,2,2,2,3,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+        6,6,2,8,3,3,5,5,4,2,2,2,5,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+        2,6,2,6,3,3,3,3,2,2,2,2,4,4,4,4,
+        2,6,2,6,4,4,4,4,2,5,2,5,5,5,5,5,
+        2,6,2,6,3,3,3,3,2,2,2,2,4,4,4,4,
+        2,5,2,5,4,4,4,4,2,4,2,4,4,4,4,4,
+        2,6,2,8,3,3,5,5,2,2,2,2,4,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7,
+        2,6,2,8,3,3,5,5,2,2,2,2,4,4,6,6,
+        2,5,2,8,4,4,6,6,2,4,2,7,4,4,7,7
+    };
+    if ((nes->irq_pending || nes->apu_irq_pending) && !nes->prev_irq_inhibit)
+        return 7;
+    /*
+     * Peek opcode without cpu_read(): that would tick DMC / service DMA and
+     * desync AccuracyCoin DMASync + interrupt timing over a frame.
+     */
+    {
+        u16 pc = nes->pc;
+        u8 op;
+        if (pc < 0x2000)
+            op = nes->ram[pc & 0x7FF];
+        else if (pc >= 0x8000)
+            op = mapper_prg_read(nes, pc);
+        else
+            op = 0xEA;
+        return cycles[op];
+    }
+}
+
+static void begin_vblank(struct NES *nes, int during_cpu_step, int instr_cycle) {
+    nes->ppu_status |= 0x80;
+    nes->in_vblank = 1;
+    if (nes->ppu_ctrl & 0x80) {
+        nes->nmi_pending = 1;
+        if (during_cpu_step) {
+            nes->nmi_in_instr = 1;
+            nes->nmi_instr_cycle = instr_cycle > 0 ? (u8)instr_cycle : 1;
+        }
+    }
+}
+
+static void step_cpu_apu_until(struct NES *nes, int target, int nmi_cycle, int *nmi_done) {
+    if (nmi_done && !*nmi_done && nes->cycles >= nmi_cycle) {
+        begin_vblank(nes, 0, 0);
+        *nmi_done = 1;
+    }
+    while (nes->cycles < target) {
+        if (nmi_done && !*nmi_done && nes->cycles < nmi_cycle
+            && nes->cycles + cpu_next_cycles_hint(nes) >= nmi_cycle) {
+            begin_vblank(nes, 1, nmi_cycle - nes->cycles);
+            *nmi_done = 1;
+        }
+        step_cpu_apu(nes);
+    }
+    if (nmi_done && !*nmi_done && nes->cycles >= nmi_cycle) {
+        begin_vblank(nes, 0, 0);
+        *nmi_done = 1;
+    }
+}
+
+void render_scanline(struct NES *nes, int y) {
+    u8 *line = &nes->screen[y * NES_W];
+    u8 bg_opaque[NES_W];
+    for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
+
+    if (nes->ppu_mask & 0x08) {
+        u16 v = nes->vram_addr;
+        u16 pat = (nes->ppu_ctrl & 0x10) ? 0x1000 : 0;
+
+        for (int tile = 0; tile < 33; tile++) {
+            int cx = v & 0x1F;
+            int cy = (v >> 5) & 0x1F;
+            int fy = (v >> 12) & 7;
+            u16 nt = 0x2000 | (v & 0x0C00);
+
+            u8 idx = ppu_read(nes, nt | (cy << 5) | cx);
+            u8 lo = ppu_read(nes, pat + (u16)idx * 16 + fy);
+            u8 hi = ppu_read(nes, pat + (u16)idx * 16 + fy + 8);
+
+            u8 at = ppu_read(nes, nt | 0x03C0 | ((cy >> 2) << 3) | (cx >> 2));
+            u8 pal_idx = (at >> (((cy & 2) << 1) | (cx & 2))) & 3;
+
+            for (int px = 0; px < 8; px++) {
+                int sx = tile * 8 + px - nes->fine_x;
+                if (sx < 0 || sx >= NES_W) continue;
+                u8 color = ((hi >> (7-px)) & 1) << 1 | ((lo >> (7-px)) & 1);
+                if (color) {
+                    line[sx] = nes->palette[pal_idx * 4 + color];
+                    bg_opaque[sx] = 1;
+                }
+            }
+
+            if ((v & 0x1F) == 31) { v &= ~0x1F; v ^= 0x0400; }
+            else v++;
+        }
+    }
+
+    if (nes->ppu_mask & 0x10) {
+        int sph = (nes->ppu_ctrl & 0x20) ? 16 : 8;
+        u16 spr_pat = (nes->ppu_ctrl & 0x08) ? 0x1000 : 0;
+        int cnt = 0;
+        u8 sprites[8];
+        int has_sp0 = 0;
+
+        for (int i = 0; i < 64; i++) {
+            int oy = nes->oam[i*4];
+            if (oy >= 0xEF) continue;
+            int sy = oy + 1;
+            if (y < sy || y >= sy + sph) continue;
+            if (cnt < 8) {
+                sprites[cnt] = i;
+                if (i == 0) has_sp0 = 1;
+                cnt++;
+            } else {
+                nes->ppu_status |= 0x20;
+                break;
+            }
+        }
+
+        int spr_clip = !(nes->ppu_mask & 0x04);
+        int sp0_left_clip = !(nes->ppu_mask & 0x02) || spr_clip;
+
+        for (int s = cnt - 1; s >= 0; s--) {
+            int i = sprites[s];
+            int sy = nes->oam[i*4] + 1;
+            int tile = nes->oam[i*4+1];
+            int attr = nes->oam[i*4+2];
+            int sx = nes->oam[i*4+3];
+
+            int row = y - sy;
+            if (attr & 0x80) row = sph - 1 - row;
+
+            u16 pa;
+            if (sph == 16) {
+                u16 bk = (tile & 1) ? 0x1000 : 0;
+                u8 t = tile & 0xFE;
+                if (row >= 8) { t++; row -= 8; }
+                pa = bk + t * 16 + row;
+            } else {
+                pa = spr_pat + tile * 16 + row;
+            }
+
+            u8 lo = ppu_read(nes, pa);
+            u8 hi = ppu_read(nes, pa + 8);
+            u8 spal = (attr & 3) + 4;
+
+            for (int px = 0; px < 8; px++) {
+                int bx = (attr & 0x40) ? px : (7 - px);
+                u8 c = ((hi >> bx) & 1) << 1 | ((lo >> bx) & 1);
+                if (!c) continue;
+                int dx = sx + px;
+                if (dx >= NES_W) continue;
+                if (has_sp0 && i == 0 && bg_opaque[dx] && dx < 255
+                    && (nes->ppu_mask & 0x08)
+                    && !(sp0_left_clip && dx < 8))
+                    nes->ppu_status |= 0x40;
+                if (spr_clip && dx < 8) continue;
+                if ((attr & 0x20) && bg_opaque[dx]) continue;
+                line[dx] = nes->palette[spal * 4 + c];
+            }
+        }
+    }
+
+    if (!(nes->ppu_mask & 0x02))
+        for (int x = 0; x < 8; x++) line[x] = nes->palette[0];
+}
+
+void run_frame(struct NES *nes) {
+    nes->cycles = nes->frame_cpu_overrun;
+    nes->in_vblank = 0;
+    int target = 0, sl_acc = nes->frame_cycle_rem;
+    int vblank_nmi_done = 0;
+    int sl_num = nes->is_pal ? (341 * 5) : 341;
+    int sl_den = nes->is_pal ? 16 : 3;
+    int total_sl = nes->num_scanlines;
+    int skip_dot = 0;
+
+    for (int y = 0; y < 240; y++) {
+        if (nes->ppu_mask & 0x18) copy_scroll_x(nes);
+
+        render_scanline(nes, y);
+        if (nes->ppu_mask & 0x18) inc_scroll_y(nes);
+
+        int irq_target = target + (260 * sl_num) / (341 * sl_den);
+        sl_acc += sl_num;
+        target += sl_acc / sl_den;
+        sl_acc %= sl_den;
+
+        step_cpu_apu_until(nes, irq_target, 0, 0);
+        mapper_scanline_clock(nes);
+
+        step_cpu_apu_until(nes, target, 0, 0);
+    }
+
+    for (int y = 240; y < total_sl; y++) {
+        int sl_start = target;
+        if (y == total_sl - 1) {
+            nes->ppu_status &= ~0xE0;
+            nes->in_vblank = 0;
+            if (nes->ppu_mask & 0x18) copy_scroll_y(nes);
+        }
+        if (y == total_sl - 2)
+            skip_dot = !nes->is_pal && nes->odd_frame && (nes->ppu_mask & 0x18);
+        int cur_sl_num = sl_num;
+        if (y == total_sl - 1 && skip_dot)
+            cur_sl_num = 340;
+        sl_acc += cur_sl_num;
+        target += sl_acc / sl_den;
+        sl_acc %= sl_den;
+
+        if (y == total_sl - 1) {
+            int irq_target = target - (cur_sl_num / sl_den) + (260 * sl_num) / (341 * sl_den);
+            step_cpu_apu_until(nes, irq_target, 0, 0);
+            mapper_scanline_clock(nes);
+        }
+
+        /*
+         * VBlank NMI at the scanline 240→241 boundary (start of vblank / dot 0–1).
+         * Trigger during the last instruction of post-render when possible so
+         * nmi_in_instr is set for BRK/IRQ hijack (AccuracyCoin NmiAndBrk/Irq).
+         * Fallback on 241 if the CPU had not reached the boundary yet.
+         */
+        if (y == 240)
+            step_cpu_apu_until(nes, target, target, &vblank_nmi_done);
+        else if (y == 241 && !vblank_nmi_done)
+            step_cpu_apu_until(nes, target, sl_start + 1, &vblank_nmi_done);
+        else
+            step_cpu_apu_until(nes, target, 0, 0);
+    }
+
+    nes->frame_cycle_rem = sl_acc;
+    nes->frame_cpu_overrun = nes->cycles - target;
+    if (nes->frame_cpu_overrun < 0)
+        nes->frame_cpu_overrun = 0;
+    if (nes->ppu_open_bus_decay_low && --nes->ppu_open_bus_decay_low == 0)
+        nes->ppu_open_bus &= 0xE0;
+    if (nes->ppu_open_bus_decay_high && --nes->ppu_open_bus_decay_high == 0)
+        nes->ppu_open_bus &= 0x1F;
+    if (!nes->is_pal)
+        nes->odd_frame ^= 1;
+}
+
+void scale_to_framebuf(u32 *fb, const u8 *scr, u8 mask) {
+    int grey = mask & 0x01;
+    int emph_r = (mask >> 5) & 1;
+    int emph_g = (mask >> 6) & 1;
+    int emph_b = (mask >> 7) & 1;
+
+    for (int ny = 0; ny < NES_H; ny++) {
+        int sy = OFF_Y + ny * SCALE;
+        for (int nx = 0; nx < NES_W; nx++) {
+            u8 idx = scr[ny * NES_W + nx] & 0x3F;
+            if (grey) idx &= 0x30;
+            u32 c = nes_rgb(idx);
+            if (emph_r | emph_g | emph_b) {
+                u32 r = (c >> 16) & 0xFF;
+                u32 g = (c >> 8) & 0xFF;
+                u32 b = c & 0xFF;
+                if (emph_g | emph_b) r = r * 3 / 4;
+                if (emph_r | emph_b) g = g * 3 / 4;
+                if (emph_r | emph_g) b = b * 3 / 4;
+                c = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+            int sx = OFF_X + nx * SCALE;
+            for (int dy = 0; dy < SCALE; dy++) {
+                u32 *row = &fb[(sy + dy) * SCR_W + sx];
+                for (int dx = 0; dx < SCALE; dx++)
+                    row[dx] = c;
+            }
+        }
+    }
+}
+
+int str_len(const char *s) {
+    int n = 0;
+    while (*s++) n++;
+    return n;
+}
+
+void draw_char(u8 *scr, int x, int y, char ch, u8 color) {
+    int gid = font_gid(ch);
+    if (gid < 0) return;
+    const u8 *glyph = font_pack[gid];
+
+    for (int r = 0; r < 8; r++) {
+        u8 bits = glyph[r];
+        for (int c = 0; c < 8; c++) {
+            if (bits & (0x80 >> c)) {
+                int px = x + c, py = y + r;
+                if (px >= 0 && px < NES_W && py >= 0 && py < NES_H)
+                    scr[py * NES_W + px] = color;
+            }
+        }
+    }
+}
+
+void draw_str(u8 *scr, int x, int y, const char *s, u8 color) {
+    while (*s) {
+        draw_char(scr, x, y, *s, color);
+        x += 8;
+        s++;
+    }
+}
+
+void draw_str_limit(u8 *scr, int x, int y, const char *s, int max_chars, u8 color) {
+    int n = 0;
+    while (*s && n < max_chars) {
+        draw_char(scr, x, y, *s, color);
+        x += 8;
+        s++;
+        n++;
+    }
+}
+
+void draw_centered(u8 *scr, int y, const char *s, u8 color) {
+    int x = (NES_W - str_len(s) * 8) / 2;
+    if (x < 0) x = 0;
+    draw_str(scr, x, y, s, color);
+}
+
+void draw_hline(u8 *scr, int y, int x1, int x2, u8 color) {
+    if (y < 0 || y >= NES_H) return;
+    if (x1 < 0) x1 = 0;
+    for (int x = x1; x < x2 && x < NES_W; x++)
+        scr[y * NES_W + x] = color;
+}
+
+void draw_vline(u8 *scr, int x, int y1, int y2, u8 color) {
+    if (x < 0 || x >= NES_W) return;
+    if (y1 < 0) y1 = 0;
+    for (int y = y1; y < y2 && y < NES_H; y++)
+        scr[y * NES_W + x] = color;
+}
+
+void draw_rect(u8 *scr, int x, int y, int w, int h, u8 color) {
+    int x2 = x + w, y2 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x2 > NES_W) x2 = NES_W;
+    if (y2 > NES_H) y2 = NES_H;
+    for (int py = y; py < y2; py++)
+        for (int px = x; px < x2; px++)
+            scr[py * NES_W + px] = color;
+}
+
+void draw_box(u8 *scr, int x, int y, int w, int h, u8 color) {
+    draw_hline(scr, y, x, x + w, color);
+    draw_hline(scr, y + h - 1, x, x + w, color);
+    draw_vline(scr, x, y, y + h, color);
+    draw_vline(scr, x + w - 1, y, y + h, color);
+}
+
+int is_rom_file(const char *name) {
+    int len = str_len(name);
+    if (len < 5) return 0;
+    char a = name[len-4], b = name[len-3], c = name[len-2], d = name[len-1];
+    if (a != '.') return 0;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    if (c >= 'A' && c <= 'Z') c += 32;
+    if (d >= 'A' && d <= 'Z') d += 32;
+    return (b == 'r' && c == 'o' && d == 'm') || (b == 'n' && c == 'e' && d == 's');
+}
+
+void extract_rom_name(const char *fn, char *out, int max) {
+    int i = 0;
+    while (fn[i] && fn[i] != '.' && i < max - 1) {
+        out[i] = fn[i];
+        i++;
+    }
+    out[i] = '\0';
+}

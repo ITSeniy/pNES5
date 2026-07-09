@@ -1,0 +1,48 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.nes
+
+# Local / generated
+__pycache__/
+*.pyc
+.codex_tmp/
+mmc3_scanline.ppm
+nes_emu.bin
+nes_emu.elf
+
+# Host test binaries (no extension); keep tests/*.c
+tests/core_smoke
+tests/apu_smoke
+tests/nes_romtest
+tests/nes_romtest_trace
+tests/t2007
+tests/dmc_io_suite
+tests/dmc_openbus_exact
+tests/dmc_openbus_test
+tests/dmc_2007_exact
+tests/dmc_busconflict
+tests/dmc_conflict_loop
+tests/dmc_interval
+tests/dmc_tick_interval
+tests/dmc_post_catch
+tests/dmc_sync_exact
+tests/dmc_dmsync50
+tests/dmc_phase_harness
+tests/dmc_residual
+tests/dmc_diag
+tests/dmc_diag2
+tests/dmc_diag3
+tests/dmc_diag4
+tests/dmc_bit4015
+tests/dmc_period_measure
+tests/dmc_req_rate
+tests/dmc_steal_count
+tests/dmc_sync_loop
+tests/dmc_tickratio
+tests/dmc_trace
+tests/dmc_force_halt
+
+# Large external test ROM pack (not part of the emulator core)
+nes-test-roms-master/
