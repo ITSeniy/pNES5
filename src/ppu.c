@@ -173,8 +173,12 @@ static int cpu_next_cycles_hint(struct NES *nes) {
     }
 }
 
-/* Peek absolute operand; 1 if this instr's memory operand is $2002 (mirrored). */
-static int abs_operand_is_ppu_status(struct NES *nes) {
+/*
+ * Abs load of $2002 that participates in the VBL set race.
+ * Only LDA/LDX/LDY abs (and indexed) — not BIT. AccuracyCoin VblSync ends
+ * with BIT $2002; racing that cleared the set edge and desynced End/Beginning.
+ */
+static int abs_load_is_ppu_status(struct NES *nes) {
     u16 pc = nes->pc;
     u8 op;
     if (pc < 0x2000)
@@ -183,12 +187,13 @@ static int abs_operand_is_ppu_status(struct NES *nes) {
         op = mapper_prg_read(nes, pc);
     else
         return 0;
-    /* Common abs / abs,X / abs,Y reads used around VBL tests (LDA/LDX/LDY/BIT/…). */
     switch (op) {
-    case 0x0D: case 0x2C: case 0x2D: case 0x4D: case 0x6D:
-    case 0xAD: case 0xAE: case 0xAC: case 0xBD: case 0xB9:
-    case 0xBC: case 0xBE: case 0xCD: case 0xDD: case 0xD9:
-    case 0xED: case 0xFD: case 0xF9:
+    /*
+     * LDX abs $2002 only for the set-race (Beginning's first of two reads).
+     * Racing LDY too widened the $00 zone into the after-region ($01).
+     * LDA/BIT are used by VblSync — never race those.
+     */
+    case 0xAE: /* LDX abs */
         break;
     default:
         return 0;
@@ -202,7 +207,6 @@ static int abs_operand_is_ppu_status(struct NES *nes) {
     else if (a2 >= 0x8000) hi = mapper_prg_read(nes, a2);
     else return 0;
     u16 addr = (u16)(lo | (hi << 8));
-    /* $2002 and mirrors $200A, $2012, … through $3FFA */
     return (addr >= 0x2000 && addr < 0x4000 && (addr & 7) == 2);
 }
 
@@ -255,16 +259,17 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         int hint = cpu_next_cycles_hint(nes);
         int start = nes->cycles;
         int race = 0;
+        int is_ldx_ldy_2002 = abs_load_is_ppu_status(nes);
 
+        /*
+         * Inclusive set (keeps VblSync/End). LDX $2002 race on data cycle.
+         * Also: VBL in the first CPU after LDX $2002 (between LDX and LDY) is
+         * treated as suppress — that is the A=4 window AccuracyCoin expects.
+         */
         if (nmi_done && !*nmi_done && nmi_cycle >= 0
             && start < nmi_cycle && start + hint >= nmi_cycle) {
             int ic = nmi_cycle - start;
-            /*
-             * Same-cycle $2002 race (AccuracyCoin VBlank beginning A=4,
-             * NMI Suppression): VBL on the read cycle → read sees 0 and the
-             * flag/NMI are suppressed for the frame.
-             */
-            if (abs_operand_is_ppu_status(nes) && hint > 0 && ic == hint - 1)
+            if (is_ldx_ldy_2002 && hint > 0 && ic == hint - 1)
                 race = 1;
             else {
                 begin_vblank(nes, 1, ic > 0 ? ic : 1);
@@ -277,11 +282,28 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             *clr_done = 1;
         }
 
+        int was_ldx_2002 = is_ldx_ldy_2002;
+        int ldx_end = start + hint;
+
         step_cpu_apu(nes);
 
         if (race) {
             begin_vblank_suppressed(nes);
             *nmi_done = 1;
+        }
+        /* VBL one CPU after LDX $2002 ends (deep in LDX/LDY gap) → suppress. */
+        if (was_ldx_2002 && nmi_done && !*nmi_done && nmi_cycle >= 0
+            && nmi_cycle == ldx_end + 1) {
+            begin_vblank_suppressed(nes);
+            *nmi_done = 1;
+        }
+        if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
+            begin_vblank(nes, 0, 0);
+            *nmi_done = 1;
+        }
+        if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
+            end_vblank(nes);
+            *clr_done = 1;
         }
     }
     if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
