@@ -53,6 +53,15 @@ void dmc_tick(struct NES *nes) {
     (void)nes;
 }
 
+void apu_on_cpu_cycle_begin(struct NES *nes) {
+    (void)nes;
+}
+
+void ppu_on_mask_write(struct NES *nes, u8 prev_mask) {
+    (void)nes;
+    (void)prev_mask;
+}
+
 static int expect_u8(const char *name, u8 got, u8 want) {
     if (got == want) return 0;
     printf("%s: got 0x%02X, want 0x%02X\n", name, got, want);
@@ -87,14 +96,17 @@ static int test_cpu_open_bus(void) {
     nes.cpu_data_bus = 0x50;
     fails += expect_u8("open bus page-cross keeps old high", cpu_read(&nes, 0x5108), 0x50);
 
-    /* $4015 does not update the external data bus; bit 5 is open bus */
+    /* $4015 does not update the *external* data bus; bit 5 is from *internal*. */
     nes.cpu_data_bus = 0x40;
+    nes.cpu_db_internal = 0x00;
     u8 r4015 = cpu_read(&nes, 0x4015);
-    fails += expect_u8("4015 leaves bus", nes.cpu_data_bus, 0x40);
-    fails += expect_u8("4015 bit5 open clear", r4015 & 0x20, 0x00);
-    nes.cpu_data_bus = 0x20;
+    fails += expect_u8("4015 leaves external bus", nes.cpu_data_bus, 0x40);
+    fails += expect_u8("4015 bit5 from internal clear", r4015 & 0x20, 0x00);
+    nes.cpu_data_bus = 0x00; /* external alone must not set bit5 */
+    nes.cpu_db_internal = 0x20;
     r4015 = cpu_read(&nes, 0x4015);
-    fails += expect_u8("4015 bit5 from bus", r4015 & 0x20, 0x20);
+    fails += expect_u8("4015 bit5 from internal set", r4015 & 0x20, 0x20);
+    fails += expect_u8("4015 leaves external after bit5", nes.cpu_data_bus, 0x00);
 
     /* Writes always update the bus */
     cpu_write(&nes, 0x4015, 0xAB);
