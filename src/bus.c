@@ -311,10 +311,13 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
             if (!(prev & 0x80) && (val & 0x80) && (nes->ppu_status & 0x80)) {
                 /*
                  * Enable while VBlank already set → rising NMI edge.
-                 * No nmi_delay: take at the next instruction boundary
-                 * (blargg 07-nmi_on_timing; delay=1 was one instr too late).
+                 * nmi_delay=1: interrupt is polled before the write cycle of
+                 * STA, so NMI is first eligible on the *following* instruction
+                 * (AccuracyCoin NMI Control test 8: STA $2000 / LDX #$10 / NMI).
+                 * Taking NMI before that LDX fails with ErrorCode 8.
                  */
                 nes->nmi_pending = 1;
+                nes->nmi_delay = 1;
             }
             break;
         }
