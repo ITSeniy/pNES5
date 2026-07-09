@@ -16217,6 +16217,11 @@ SetUpSpriteZero_Loop:
 	INY
 	CPY #$4
 	BNE SetUpSpriteZero_Loop
+	; Copy page 2 into OAM. Several tests (e.g. Rendering Flag Behavior) only
+	; call SetUpSpriteZero and never STA $4014; without this, sprite zero is
+	; never in OAM while NMI (which normally DMAs) is disabled by RunTest.
+	LDA #2
+	STA $4014
 	JSR FixRTS
 	RTS
 ;;;;;;;
