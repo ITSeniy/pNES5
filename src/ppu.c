@@ -115,12 +115,9 @@ static void step_cpu_apu_until(struct NES *nes, int target, int nmi_cycle, int *
 int render_scanline(struct NES *nes, int y) {
     u8 *line = &nes->screen[y * NES_W];
     /*
-     * Must NOT be static/global: the JIT maps shellcode RX (W^X). Writing a
-     * static in the code image faults. Heap (nes->*) and stack are fine —
-     * menu never hit this path; first ROM frame did and crashed.
+     * Stack (not static): JIT shellcode is RX; static writes fault on PS.
      */
     u8 bg_opaque[NES_W];
-    int sp0_overlap = 0;
     for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
 
     /*
@@ -132,6 +129,11 @@ int render_scanline(struct NES *nes, int y) {
     int any_render = (nes->ppu_mask & 0x18) != 0;
     int show_bg = (nes->ppu_mask & 0x08) != 0;
     int show_spr = (nes->ppu_mask & 0x10) != 0;
+    nes->sp0_overlap = 0;
+
+    /* OAMADDR forced through 0 during sprite fetch (dots 257–320). */
+    if (any_render)
+        nes->oam_addr = 0;
 
     if (any_render) {
         u16 v = nes->vram_addr;
@@ -223,8 +225,8 @@ int render_scanline(struct NES *nes, int y) {
                 if (dx >= NES_W) continue;
                 if (has_sp0 && i == 0 && bg_opaque[dx] && dx < 255
                     && !(sp0_left_clip && dx < 8)) {
-                    sp0_overlap = 1;
-                    /* Both show bits required for the hit; may rise mid-line. */
+                    nes->sp0_overlap = 1;
+                    /* Both show bits required; mid-line enable via $2001 write. */
                     if (show_bg && show_spr)
                         nes->ppu_status |= 0x40;
                 }
@@ -238,7 +240,7 @@ int render_scanline(struct NES *nes, int y) {
 
     if (!(nes->ppu_mask & 0x02))
         for (int x = 0; x < 8; x++) line[x] = nes->palette[0];
-    return sp0_overlap;
+    return nes->sp0_overlap;
 }
 
 void run_frame(struct NES *nes) {
@@ -254,7 +256,7 @@ void run_frame(struct NES *nes) {
     for (int y = 0; y < 240; y++) {
         if (nes->ppu_mask & 0x18) copy_scroll_x(nes);
 
-        int sp0_overlap = render_scanline(nes, y);
+        render_scanline(nes, y);
         if (nes->ppu_mask & 0x18) inc_scroll_y(nes);
 
         int irq_target = target + (260 * sl_num) / (341 * sl_den);
@@ -266,13 +268,8 @@ void run_frame(struct NES *nes) {
         mapper_scanline_clock(nes);
 
         step_cpu_apu_until(nes, target, 0, 0);
-
-        /*
-         * Mid-scanline $2001 can enable the missing BG/sprite bit after the
-         * line was drawn; if overlap was already in the shift regs, set sp0.
-         */
-        if (sp0_overlap && (nes->ppu_mask & 0x18) == 0x18)
-            nes->ppu_status |= 0x40;
+        /* Overlap flag is consumed on $2001 mid-line; drop at hblank. */
+        nes->sp0_overlap = 0;
     }
 
     for (int y = 240; y < total_sl; y++) {
@@ -280,6 +277,13 @@ void run_frame(struct NES *nes) {
         if (y == total_sl - 1) {
             nes->ppu_status &= ~0xE0;
             nes->in_vblank = 0;
+            nes->sp0_overlap = 0;
+            /*
+             * Hardware forces OAMADDR through 0 on dots 257–320 of pre-render
+             * when rendering; we always clear so a prior $2003 write cannot
+             * misalign the next OAM DMA (AccuracyCoin sprite-zero setups).
+             */
+            nes->oam_addr = 0;
             if (nes->ppu_mask & 0x18) copy_scroll_y(nes);
         }
         if (y == total_sl - 2)

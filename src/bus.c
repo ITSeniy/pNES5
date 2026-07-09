@@ -316,6 +316,13 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
         }
         case 1:
             nes->ppu_mask = val;
+            /*
+             * Mid-scanline enable of BG+sprites can complete a sprite-zero hit
+             * if the shift regs already had opaque overlap (Rendering Flag
+             * Behavior: sprites-only then $1E just before the hit pixel).
+             */
+            if (nes->sp0_overlap && (val & 0x18) == 0x18)
+                nes->ppu_status |= 0x40;
             break;
         case 3: nes->oam_addr = val; break;
         case 4: nes->oam[nes->oam_addr++] = val; break;

@@ -92,6 +92,13 @@ struct NES {
     u16 vram_addr, temp_addr;
     u8  fine_x, write_toggle, read_buf, ppu_open_bus;
     u8  ppu_open_bus_decay_low, ppu_open_bus_decay_high;
+    /*
+     * Opaque BG+spr0 overlap found while rendering this scanline (shift regs
+     * fill even if only one of BG/sprites is shown). Committed to $2002.6 when
+     * both enable bits are on — including mid-line $2001 writes (AccuracyCoin
+     * Rendering Flag Behavior). Lives in NES (heap), never shellcode static.
+     */
+    u8  sp0_overlap;
 
     u8  ram[0x800];
     u8  sram[0x2000];
