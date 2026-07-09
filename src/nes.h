@@ -146,8 +146,18 @@ struct NES {
     /* Mapper 185: CHR open-bus when disabled */
     u8  chr_enable;
 
-    /* Last value on the external CPU data bus (open-bus floating value). */
+    /*
+     * External CPU data bus (open-bus for $4000–$4014 / $4018+).
+     * Updated on every R/W except $4015 *reads* (AccuracyCoin Internal Data Bus).
+     * DMC sample gets land here so LDA $4000 open-bus DMASync sees them.
+     */
     u8  cpu_data_bus;
+    /*
+     * Internal data bus: updated on every R/W including $4015 reads.
+     * DMC DMA does *not* write this (only the external bus). $4015 bit 5 is
+     * open bus from the *internal* latch (Internal Data Bus tests 2–3).
+     */
+    u8  cpu_db_internal;
 
     u8  pad_state, pad_shift, pad_strobe;
     /* Internal OUT0 ($4016 bit0); external pin updates only on put cycles. */

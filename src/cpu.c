@@ -36,15 +36,22 @@ static int  page_cross(u16 a, u16 b)      { return (a & 0xFF00) != (b & 0xFF00);
  *  taken, no page cross (3 cyc): no poll on last cycle → IRQ delayed one instruction
  *  taken, page cross (4 cyc): poll before cycle 4 → IRQ may run immediately after
  */
+/*
+ * Branch bus (AccuracyCoin Branch Dummy Reads):
+ *  taken, no page cross: dummy-read PC (byte after operand), then set PC
+ *  taken, page cross: dummy-read PC, then dummy-read (old_PCH|new_PCL), then
+ *  fix PCH — that intermediate address can be $20xx and clear $2002.vblank
+ */
 #define BR(cond) do { \
     s8 off = (s8)cpu_read(nes, nes->pc++); \
     if (cond) { \
         u16 old_pc = nes->pc; \
-        xp = page_cross(old_pc, (u16)(old_pc + off)); \
+        u16 new_pc = (u16)(old_pc + off); \
+        xp = page_cross(old_pc, new_pc); \
         (void)cpu_read(nes, old_pc); \
-        nes->pc = (u16)(old_pc + off); \
         if (xp) { \
-            (void)cpu_read(nes, nes->pc); \
+            u16 wrong = (u16)((old_pc & 0xFF00) | (new_pc & 0xFF)); \
+            (void)cpu_read(nes, wrong); \
             nes->prev_irq_inhibit = nes->flags & F_I; \
         } else { \
             /* Last-cycle poll skipped: delay IRQ/NMI by one instruction. */ \
@@ -52,6 +59,7 @@ static int  page_cross(u16 a, u16 b)      { return (a & 0xFF00) != (b & 0xFF00);
             if (nes->nmi_pending && !nes->nmi_delay) \
                 nes->nmi_delay = 1; \
         } \
+        nes->pc = new_pc; \
         nes->cycles += 1 + xp; \
     } \
 } while(0)
@@ -243,7 +251,7 @@ void cpu_step(struct NES *nes) {
     case 0x07: addr=ZP(); val=rmw_asl(nes,addr); nes->a|=val; SET_ZN(nes->a); nes->cycles+=5; return;
     case 0x08: (void)cpu_read(nes, nes->pc); push8(nes,nes->flags|F_B|F_U); nes->cycles+=3; return;
     case 0x09: nes->a|=cpu_read(nes,IMM()); SET_ZN(nes->a); nes->cycles+=2; return;
-    case 0x0A: nes->flags=(nes->flags&~F_C)|(nes->a>>7); nes->a<<=1; SET_ZN(nes->a); nes->cycles+=2; return;
+    case 0x0A: (void)cpu_read(nes, nes->pc); nes->flags=(nes->flags&~F_C)|(nes->a>>7); nes->a<<=1; SET_ZN(nes->a); nes->cycles+=2; return;
     case 0x0B: nes->a&=cpu_read(nes,IMM()); SET_ZN(nes->a); nes->flags=(nes->flags&~F_C)|((nes->a>>7)&1); nes->cycles+=2; return;
     case 0x0C: addr=ABS(); cpu_read(nes,addr); nes->cycles+=4; return;
     case 0x0D: nes->a|=cpu_read(nes,ABS()); SET_ZN(nes->a); nes->cycles+=4; return;
@@ -310,7 +318,7 @@ void cpu_step(struct NES *nes) {
         return;
     }
     case 0x29: nes->a&=cpu_read(nes,IMM()); SET_ZN(nes->a); nes->cycles+=2; return;
-    case 0x2A: t8=nes->a>>7; nes->a=(nes->a<<1)|(nes->flags&F_C); nes->flags=(nes->flags&~F_C)|t8; SET_ZN(nes->a); nes->cycles+=2; return;
+    case 0x2A: (void)cpu_read(nes, nes->pc); t8=nes->a>>7; nes->a=(nes->a<<1)|(nes->flags&F_C); nes->flags=(nes->flags&~F_C)|t8; SET_ZN(nes->a); nes->cycles+=2; return;
     case 0x2B: nes->a&=cpu_read(nes,IMM()); SET_ZN(nes->a); nes->flags=(nes->flags&~F_C)|((nes->a>>7)&1); nes->cycles+=2; return;
     case 0x2C: val=cpu_read(nes,ABS()); nes->flags=(nes->flags&~(F_Z|F_V|F_N))|((nes->a&val)==0?F_Z:0)|(val&0xC0); nes->cycles+=4; return;
     case 0x2D: nes->a&=cpu_read(nes,ABS()); SET_ZN(nes->a); nes->cycles+=4; return;
@@ -344,7 +352,7 @@ void cpu_step(struct NES *nes) {
     case 0x47: addr=ZP(); val=rmw_lsr(nes,addr); nes->a^=val; SET_ZN(nes->a); nes->cycles+=5; return;
     case 0x48: (void)cpu_read(nes, nes->pc); push8(nes,nes->a); nes->cycles+=3; return;
     case 0x49: nes->a^=cpu_read(nes,IMM()); SET_ZN(nes->a); nes->cycles+=2; return;
-    case 0x4A: nes->flags=(nes->flags&~F_C)|(nes->a&1); nes->a>>=1; SET_ZN(nes->a); nes->cycles+=2; return;
+    case 0x4A: (void)cpu_read(nes, nes->pc); nes->flags=(nes->flags&~F_C)|(nes->a&1); nes->a>>=1; SET_ZN(nes->a); nes->cycles+=2; return;
     case 0x4B: nes->a&=cpu_read(nes,IMM()); nes->flags=(nes->flags&~F_C)|(nes->a&1); nes->a>>=1; SET_ZN(nes->a); nes->cycles+=2; return;
     case 0x4C: nes->pc=ABS(); nes->cycles+=3; return;
     case 0x4D: nes->a^=cpu_read(nes,ABS()); SET_ZN(nes->a); nes->cycles+=4; return;
@@ -388,7 +396,7 @@ void cpu_step(struct NES *nes) {
     case 0x67: addr=ZP(); val=rmw_ror(nes,addr); do_adc(nes,val); nes->cycles+=5; return;
     case 0x68: (void)cpu_read(nes, nes->pc); (void)cpu_read(nes, (u16)(0x100 | nes->sp)); nes->a=pull8(nes); SET_ZN(nes->a); nes->cycles+=4; return;
     case 0x69: val=cpu_read(nes,IMM()); do_adc(nes,val); nes->cycles+=2; return;
-    case 0x6A: t8=nes->a&1; nes->a=(nes->a>>1)|((nes->flags&F_C)<<7); nes->flags=(nes->flags&~F_C)|t8; SET_ZN(nes->a); nes->cycles+=2; return;
+    case 0x6A: (void)cpu_read(nes, nes->pc); t8=nes->a&1; nes->a=(nes->a>>1)|((nes->flags&F_C)<<7); nes->flags=(nes->flags&~F_C)|t8; SET_ZN(nes->a); nes->cycles+=2; return;
     case 0x6B:
         nes->a&=cpu_read(nes,IMM());
         nes->a=(nes->a>>1)|((nes->flags&F_C)<<7);

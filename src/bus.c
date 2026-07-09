@@ -59,6 +59,7 @@ static u8 cpu_bus_put(struct NES *nes, u8 val) {
         return nes->cpu_data_bus;
     }
     nes->cpu_data_bus = val;
+    nes->cpu_db_internal = val;
     return val;
 }
 
@@ -157,8 +158,13 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
          */
         nes->frame_irq_clear_pending = 1;
         nes->apu_irq_pending = (nes->frame_irq_flag || nes->dmc.irq_flag) ? 1 : 0;
-        /* Internal $4015 does not drive the external data bus. */
-        result = (result & (u8)~0x20) | (nes->cpu_data_bus & 0x20);
+        /*
+         * Bit 5 is open bus from the *internal* data bus. $4015 does not update
+         * the external bus (subsequent open-bus keeps the prior external value).
+         * Internal bus *is* updated with this read result.
+         */
+        result = (result & (u8)~0x20) | (nes->cpu_db_internal & 0x20);
+        nes->cpu_db_internal = result;
         skip_bus_update = 1;
     } else if (addr == 0x4016) {
         /*
@@ -276,10 +282,12 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
 
     if (addr == 0x4010 || addr == 0x4015 || addr == 0x4017) {
         nes->cpu_data_bus = val;
+        nes->cpu_db_internal = val;
         nes->joy_oe_addr = 0;
         apu_write_reg(nes, addr, val);
         /* Keep write data on the bus after any load-DMA side effects. */
         nes->cpu_data_bus = val;
+        nes->cpu_db_internal = val;
         dmc_tick(nes);
         return;
     }
@@ -289,6 +297,7 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
          * OUT0 latched before put-cycle apply in dmc_tick (Controller Strobing).
          */
         nes->cpu_data_bus = val;
+        nes->cpu_db_internal = val;
         nes->joy_oe_addr = 0;
         nes->pad_out0 = val & 1;
         dmc_tick(nes);
@@ -296,6 +305,7 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
     }
 
     nes->cpu_data_bus = val;
+    nes->cpu_db_internal = val;
     nes->joy_oe_addr = 0;
     dmc_tick(nes);
 

@@ -16,7 +16,7 @@
 #define COL_NUM      0x21
 #define ROM_BUF_SIZE 0x400000
 #define STATE_MAGIC 0x30545345u /* EST0 */
-#define STATE_VERSION 11u
+#define STATE_VERSION 12u
 #define CMD_STATE_LOAD 0xFC
 #define CMD_STATE_SAVE 0xFD
 #define CMD_MENU 0xFE
@@ -157,7 +157,7 @@ struct nes_state_core {
     u8  fme7_ram_mode;
     u8  chr_enable;
 
-    u8  cpu_data_bus;
+    u8  cpu_data_bus, cpu_db_internal;
     u8  pad_state, pad_shift, pad_strobe, pad_out0;
     u8  irq_pending, prev_irq_inhibit, apu_irq_pending;
     struct pulse_ch    pulse[2];
@@ -238,6 +238,7 @@ static void capture_state(struct NES *nes, struct nes_state_core *st) {
     st->chr_enable = nes->chr_enable;
 
     st->cpu_data_bus = nes->cpu_data_bus;
+    st->cpu_db_internal = nes->cpu_db_internal;
     st->pad_state = nes->pad_state; st->pad_shift = nes->pad_shift;
     st->pad_strobe = nes->pad_strobe; st->pad_out0 = nes->pad_out0;
     st->irq_pending = nes->irq_pending;
@@ -320,6 +321,7 @@ static int restore_state(struct NES *nes, const struct nes_state_core *st) {
     nes->chr_enable = st->chr_enable;
 
     nes->cpu_data_bus = st->cpu_data_bus;
+    nes->cpu_db_internal = st->cpu_db_internal;
     nes->pad_state = 0; nes->pad_shift = st->pad_shift; nes->pad_strobe = st->pad_strobe;
     nes->pad_out0 = st->pad_out0;
     nes->irq_pending = st->irq_pending; nes->prev_irq_inhibit = st->prev_irq_inhibit;
