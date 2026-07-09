@@ -24,6 +24,98 @@ static void copy_scroll_y(struct NES *nes) {
     nes->vram_addr = (nes->vram_addr & 0x041F) | (nes->temp_addr & 0xFBE0);
 }
 
+/*
+ * Latch whether spr0 and BG share an opaque pixel on scanline y using the
+ * line's v (ppu_line_v). Does not paint. Used when $2001 enables partial
+ * rendering mid-line after the line was drawn with rendering off.
+ */
+static void ppu_eval_sp0_overlap(struct NES *nes, int y) {
+    u8 bg_opaque[NES_W];
+    for (int x = 0; x < NES_W; x++) bg_opaque[x] = 0;
+
+    u16 v = nes->ppu_line_v;
+    u16 pat = (nes->ppu_ctrl & 0x10) ? 0x1000 : 0;
+    for (int tile = 0; tile < 33; tile++) {
+        int cx = v & 0x1F;
+        int cy = (v >> 5) & 0x1F;
+        int fy = (v >> 12) & 7;
+        u16 nt = 0x2000 | (v & 0x0C00);
+        u8 idx = ppu_read(nes, nt | (cy << 5) | cx);
+        u8 lo = ppu_read(nes, pat + (u16)idx * 16 + fy);
+        u8 hi = ppu_read(nes, pat + (u16)idx * 16 + fy + 8);
+        for (int px = 0; px < 8; px++) {
+            int sx = tile * 8 + px - nes->fine_x;
+            if (sx < 0 || sx >= NES_W) continue;
+            u8 color = ((hi >> (7 - px)) & 1) << 1 | ((lo >> (7 - px)) & 1);
+            if (color) bg_opaque[sx] = 1;
+        }
+        if ((v & 0x1F) == 31) { v &= ~0x1F; v ^= 0x0400; }
+        else v++;
+    }
+
+    int sph = (nes->ppu_ctrl & 0x20) ? 16 : 8;
+    u16 spr_pat = (nes->ppu_ctrl & 0x08) ? 0x1000 : 0;
+    int oy = nes->oam[0];
+    if (oy >= 0xEF) return;
+    int sy = oy + 1;
+    if (y < sy || y >= sy + sph) return;
+
+    int tile = nes->oam[1];
+    int attr = nes->oam[2];
+    int sx = nes->oam[3];
+    int row = y - sy;
+    if (attr & 0x80) row = sph - 1 - row;
+    u16 pa;
+    if (sph == 16) {
+        u16 bk = (tile & 1) ? 0x1000 : 0;
+        u8 t = tile & 0xFE;
+        if (row >= 8) { t++; row -= 8; }
+        pa = bk + t * 16 + row;
+    } else {
+        pa = spr_pat + tile * 16 + row;
+    }
+    u8 lo = ppu_read(nes, pa);
+    u8 hi = ppu_read(nes, pa + 8);
+    int spr_clip = !(nes->ppu_mask & 0x04);
+    int sp0_left_clip = !(nes->ppu_mask & 0x02) || spr_clip;
+    for (int px = 0; px < 8; px++) {
+        int bx = (attr & 0x40) ? px : (7 - px);
+        u8 c = ((hi >> bx) & 1) << 1 | ((lo >> bx) & 1);
+        if (!c) continue;
+        int dx = sx + px;
+        if (dx >= NES_W || dx >= 255) continue;
+        if (sp0_left_clip && dx < 8) continue;
+        if (bg_opaque[dx]) {
+            nes->sp0_overlap = 1;
+            return;
+        }
+    }
+}
+
+void ppu_on_mask_write(struct NES *nes, u8 prev_mask) {
+    u8 prev_r = prev_mask & 0x18;
+    u8 new_r = nes->ppu_mask & 0x18;
+    int y = nes->ppu_cur_scanline;
+
+    if (y < 0 || y >= 240 || nes->in_vblank)
+        goto commit;
+
+    if (new_r && new_r != prev_r) {
+        /*
+         * Test 1: 0 → $1E late must NOT invent filled shift regs.
+         * Test 2: 0 → $10 (or already $10 from render) then $1E must hit.
+         * Only (re)latch overlap when enabling a *partial* mask, or when
+         * already rendering and the mask changes.
+         */
+        if (prev_r != 0 || new_r == 0x08 || new_r == 0x10)
+            ppu_eval_sp0_overlap(nes, y);
+    }
+
+commit:
+    if (nes->sp0_overlap && new_r == 0x18)
+        nes->ppu_status |= 0x40;
+}
+
 static void step_cpu_apu(struct NES *nes) {
     /*
      * DMC timer: one tick per CPU cycle. Bus accesses tick during the instr;
@@ -246,6 +338,7 @@ int render_scanline(struct NES *nes, int y) {
 void run_frame(struct NES *nes) {
     nes->cycles = nes->frame_cpu_overrun;
     nes->in_vblank = 0;
+    nes->ppu_cur_scanline = -1;
     int target = 0, sl_acc = nes->frame_cycle_rem;
     int vblank_nmi_done = 0;
     int sl_num = nes->is_pal ? (341 * 5) : 341;
@@ -255,6 +348,7 @@ void run_frame(struct NES *nes) {
 
     for (int y = 0; y < 240; y++) {
         if (nes->ppu_mask & 0x18) copy_scroll_x(nes);
+        nes->ppu_line_v = nes->vram_addr;
 
         render_scanline(nes, y);
         if (nes->ppu_mask & 0x18) inc_scroll_y(nes);
@@ -264,10 +358,13 @@ void run_frame(struct NES *nes) {
         target += sl_acc / sl_den;
         sl_acc %= sl_den;
 
+        /* CPU window for this line — mid-line $2001 uses ppu_cur_scanline. */
+        nes->ppu_cur_scanline = (s16)y;
         step_cpu_apu_until(nes, irq_target, 0, 0);
         mapper_scanline_clock(nes);
 
         step_cpu_apu_until(nes, target, 0, 0);
+        nes->ppu_cur_scanline = -1;
         /* Overlap flag is consumed on $2001 mid-line; drop at hblank. */
         nes->sp0_overlap = 0;
     }

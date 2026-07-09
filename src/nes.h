@@ -99,6 +99,10 @@ struct NES {
      * Rendering Flag Behavior). Lives in NES (heap), never shellcode static.
      */
     u8  sp0_overlap;
+    /* Visible scanline index while its CPU runs, else -1. */
+    s16 ppu_cur_scanline;
+    /* v used for the current visible line (before inc_scroll_y). */
+    u16 ppu_line_v;
 
     u8  ram[0x800];
     u8  sram[0x2000];
@@ -219,6 +223,8 @@ u16  cpu_read16(struct NES *nes, u16 addr);
 /* ppu.c — returns 1 if opaque BG+sprite0 overlap on this scanline */
 int  render_scanline(struct NES *nes, int y);
 void run_frame(struct NES *nes);
+/* After PPUMASK write: mid-line partial→full sprite0 (Rendering Flag Behavior). */
+void ppu_on_mask_write(struct NES *nes, u8 prev_mask);
 
 /* apu.c */
 void apu_write_reg(struct NES *nes, u16 addr, u8 val);
