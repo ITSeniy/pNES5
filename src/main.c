@@ -16,7 +16,7 @@
 #define COL_NUM      0x21
 #define ROM_BUF_SIZE 0x400000
 #define STATE_MAGIC 0x30545345u /* EST0 */
-#define STATE_VERSION 9u
+#define STATE_VERSION 11u
 #define CMD_STATE_LOAD 0xFC
 #define CMD_STATE_SAVE 0xFD
 #define CMD_MENU 0xFE
@@ -166,7 +166,8 @@ struct nes_state_core {
     struct dmc_ch      dmc;
     u8  apu_status, frame_mode, frame_irq_inhibit;
     u8  frame_irq_flag, frame_reset_delay, frame_reset_mode;
-    u8  frame_irq_clear_pending;
+    u8  frame_irq_clear_pending, frame_irq_set_timer;
+    u8  frame_irq_line_delay, frame_irq_line_prev;
     s32 frame_counter, sample_acc;
     s16 lpf_prev;
     s32 hpf_in, hpf_out;
@@ -247,6 +248,9 @@ static void capture_state(struct NES *nes, struct nes_state_core *st) {
     st->frame_irq_inhibit = nes->frame_irq_inhibit; st->frame_irq_flag = nes->frame_irq_flag;
     st->frame_reset_delay = nes->frame_reset_delay; st->frame_reset_mode = nes->frame_reset_mode;
     st->frame_irq_clear_pending = nes->frame_irq_clear_pending;
+    st->frame_irq_set_timer = nes->frame_irq_set_timer;
+    st->frame_irq_line_delay = nes->frame_irq_line_delay;
+    st->frame_irq_line_prev = nes->frame_irq_line_prev;
     st->frame_counter = nes->frame_counter; st->sample_acc = nes->sample_acc;
     st->lpf_prev = nes->lpf_prev; st->hpf_in = nes->hpf_in; st->hpf_out = nes->hpf_out;
     st->cpu_freq = nes->cpu_freq; st->num_scanlines = nes->num_scanlines;
@@ -326,6 +330,9 @@ static int restore_state(struct NES *nes, const struct nes_state_core *st) {
     nes->frame_irq_inhibit = st->frame_irq_inhibit; nes->frame_irq_flag = st->frame_irq_flag;
     nes->frame_reset_delay = st->frame_reset_delay; nes->frame_reset_mode = st->frame_reset_mode;
     nes->frame_irq_clear_pending = st->frame_irq_clear_pending;
+    nes->frame_irq_set_timer = st->frame_irq_set_timer;
+    nes->frame_irq_line_delay = st->frame_irq_line_delay;
+    nes->frame_irq_line_prev = st->frame_irq_line_prev;
     nes->frame_counter = st->frame_counter; nes->sample_acc = st->sample_acc;
     nes->lpf_prev = st->lpf_prev; nes->hpf_in = st->hpf_in; nes->hpf_out = st->hpf_out;
     nes->frame_cycle_rem = st->frame_cycle_rem; nes->frame_cpu_overrun = st->frame_cpu_overrun;

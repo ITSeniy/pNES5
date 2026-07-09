@@ -150,6 +150,18 @@ struct NES {
     u8  frame_irq_flag, frame_reset_delay, frame_reset_mode;
     /* AccuracyCoin: $4015 clears frame IRQ only on put→get (next get cycle). */
     u8  frame_irq_clear_pending;
+    /*
+     * Step-4 asserts $4015.6 for 3 CPU cycles (2 if inhibit). While >0 the
+     * flag is forced and clear_pending cannot retire (tests E–H, I–L).
+     */
+    u8  frame_irq_set_timer;
+    /*
+     * Cycles to wait after $4015.6 rises before pulling the IRQ line low.
+     * Flag is readable immediately; IRQ is ~2 CPU cycles later (AccuracyCoin
+     * Frame Counter IRQ N/O: 29834/29833 after $4017, blargg min 29833).
+     */
+    u8  frame_irq_line_delay;
+    u8  frame_irq_line_prev;
     s32 frame_counter, sample_acc;
     s32 fc_step[2][6];
 

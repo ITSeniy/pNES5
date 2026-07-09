@@ -98,27 +98,68 @@ static int pulse_muted(struct pulse_ch *p, int ch) {
 }
 
 static void update_apu_irq(struct NES *nes) {
-    nes->apu_irq_pending = (nes->frame_irq_flag || nes->dmc.irq_flag) ? 1 : 0;
+    /*
+     * Frame IRQ line tracks $4015.6 while inhibit is clear (level-triggered).
+     * Inhibit keeps the line high even if the flag is briefly set (tests I–M).
+     */
+    nes->apu_irq_pending = ((nes->frame_irq_flag && !nes->frame_irq_inhibit)
+        || nes->dmc.irq_flag) ? 1 : 0;
 }
 
 /*
  * Absolute CPU cycle index for the bus access about to run (before dmc_tick).
- * Even = get, odd = put (AccuracyCoin OAM $4014 syncs so the next opcode is get).
+ *
+ * Empirically (AccuracyCoin Controller Strobing + Frame Counter IRQ 6/7 +
+ * OAM $4014 get-sync): the first opcode after OAM is odd-indexed, and that
+ * phase is a "get". Controller OUT0 updates on the opposite phase (put=even
+ * would match the names, but OUT0 gating that passed Strobing is odd — keep
+ * that hardware bit separate from the frame-IRQ get/put names).
+ *
+ * Frame IRQ clear: put→get edge = start of get = odd cycle.
  */
 static s32 cpu_bus_cycle(struct NES *nes) {
     return nes->total_cycles + nes->dmc.ticks_exec;
 }
 
-/* Frame IRQ flag clears only on put→get (start of a get cycle). */
+/* AccuracyCoin "get" after OAM sync (odd bus index). */
+static int cpu_is_get_cycle(struct NES *nes) {
+    return (cpu_bus_cycle(nes) & 1) != 0;
+}
+
+/*
+ * Frame IRQ flag clears only on put→get (start of a get cycle).
+ * During the step-4 assert window the sequencer forces $4015.6 and any
+ * pending clear is discarded (set wins) so a $4015 read on a set cycle still
+ * sees the flag on the next LDA (AccuracyCoin E–G / blargg 07.irq_flag_timing).
+ */
 void apu_on_cpu_cycle_begin(struct NES *nes) {
-    if ((cpu_bus_cycle(nes) & 1) == 0 && nes->frame_irq_clear_pending) {
-        nes->frame_irq_flag = 0;
-        nes->frame_irq_clear_pending = 0;
-        update_apu_irq(nes);
+    if (cpu_is_get_cycle(nes) && nes->frame_irq_clear_pending) {
+        /*
+         * While step-4 is still asserting, do not retire the clear — the
+         * sequencer re-sets the flag this window (handled in apu_step).
+         */
+        if (nes->frame_irq_set_timer == 0) {
+            nes->frame_irq_flag = 0;
+            nes->frame_irq_clear_pending = 0;
+            update_apu_irq(nes);
+        }
     }
 }
 
-/* OUT0 is only driven on put cycles (get→put); internal latch may change earlier. */
+/* Force $4015.6 for one CPU cycle of the step-4 window; set wins over clear. */
+static void frame_irq_assert_cycle(struct NES *nes, int last_of_window) {
+    if (nes->frame_irq_inhibit && last_of_window) {
+        /* Inhibit: flag still rises for 2 cycles, clear on the 3rd (I–L). */
+        nes->frame_irq_flag = 0;
+    } else {
+        nes->frame_irq_flag = 1;
+        /* A pending $4015 clear is lost if the flag is re-asserted. */
+        nes->frame_irq_clear_pending = 0;
+    }
+    /* Do not call update_apu_irq here — apu_step does it once per CPU cycle. */
+}
+
+/* OUT0 driven on the phase that passed Controller Strobing (odd index). */
 static void joy_apply_out0_put(struct NES *nes) {
     nes->pad_strobe = nes->pad_out0;
     if (nes->pad_out0)
@@ -171,12 +212,11 @@ static void dmc_request_dma(struct NES *nes, int is_load) {
 void dmc_tick(struct NES *nes) {
     /*
      * Cycle side effects for the access that just finished:
-     * put cycles push internal OUT0 to the controller ports (AccuracyCoin
-     * Controller Strobing tests 3–4).
+     * OUT0→controller on the odd phase (Controller Strobing 3–4).
      */
-    s32 cyc = cpu_bus_cycle(nes);
+    int out0_phase = (cpu_bus_cycle(nes) & 1) != 0;
     nes->dmc.ticks_exec++;
-    if (cyc & 1)
+    if (out0_phase)
         joy_apply_out0_put(nes);
 
     /*
@@ -541,22 +581,35 @@ void apu_write_reg(struct NES *nes, u16 addr, u8 val) {
         if (nes->frame_irq_inhibit) {
             nes->frame_irq_flag = 0;
             nes->frame_irq_clear_pending = 0;
+            nes->frame_irq_set_timer = 0;
             update_apu_irq(nes);
         }
         nes->frame_reset_mode = nes->frame_mode;
-        /* 3 vs 4 CPU delay after $4017 depends on write get/put polarity. */
-        if (cpu_bus_cycle(nes) & 1) nes->frame_reset_delay = 1; /* put → 3 */
-        else frame_reset(nes); /* get → effectively 4 with instruction apu_step */
+        /*
+         * $4017 resets the frame counter after 3 or 4 CPU cycles (put vs get).
+         * Zero the counter immediately and park the sequencer until the delay
+         * elapses so a stale phase (e.g. after WaitForVBlank following a $40
+         * run) cannot assert step-4 the instant inhibit is cleared — that made
+         * IRQ fire after CLI/LDX with X=0 (FAIL N, $50=$00).
+         */
+        nes->frame_counter = 0;
+        nes->frame_irq_set_timer = 0;
+        nes->frame_reset_delay = cpu_is_get_cycle(nes) ? 2 : 1;
         break;
     }
 }
 
 void apu_step(struct NES *nes, int cycles) {
     for (int c = 0; c < cycles; c++) {
+        int skip_frame_seq = 0;
         if (nes->frame_reset_delay) {
             nes->frame_reset_delay--;
             if (!nes->frame_reset_delay) {
                 frame_reset(nes);
+                /* Reset cycle: allow counter++ below (0 → 1). */
+            } else {
+                /* Still waiting: do not clock sequencer / IRQ asserts. */
+                skip_frame_seq = 1;
             }
         }
 
@@ -600,24 +653,30 @@ void apu_step(struct NES *nes, int cycles) {
          * access. Do not tick here or DMASync open-bus timing double-counts.
          */
 
-        nes->frame_counter++;
-        int *steps = nes->fc_step[nes->frame_mode];
-        if      (nes->frame_counter == steps[0]) clock_envelope(nes);
-        else if (nes->frame_counter == steps[1]) { clock_envelope(nes); clock_length_sweep(nes); }
-        else if (nes->frame_counter == steps[2]) clock_envelope(nes);
-        else if (nes->frame_counter == steps[4]) { clock_envelope(nes); clock_length_sweep(nes); }
-        /*
-         * Frame IRQ: set on the three step-4 clocks (not level-reasserted
-         * every cycle). Once cleared by $4015 read it must stay clear until
-         * the next step-4 (AccuracyCoin DMA+$4015 BIT after dummies).
-         */
-        if (!nes->frame_mode && !nes->frame_irq_inhibit
-            && (nes->frame_counter == steps[3]
-                || nes->frame_counter == steps[4]
-                || nes->frame_counter == steps[5]))
-            nes->frame_irq_flag = 1;
-        if (nes->frame_counter >= steps[5])
-            nes->frame_counter = 3;
+        if (!skip_frame_seq) {
+            nes->frame_counter++;
+            int *steps = nes->fc_step[nes->frame_mode];
+            if      (nes->frame_counter == steps[0]) clock_envelope(nes);
+            else if (nes->frame_counter == steps[1]) { clock_envelope(nes); clock_length_sweep(nes); }
+            else if (nes->frame_counter == steps[2]) clock_envelope(nes);
+            else if (nes->frame_counter == steps[4]) { clock_envelope(nes); clock_length_sweep(nes); }
+            /*
+             * Frame IRQ: step 4 asserts $4015.6 for 3 CPU cycles. Each assert
+             * cancels a pending $4015 clear (E–G). After the window a clear can
+             * stick (H). With inhibit, flag rises 2 cycles then clears (I–L).
+             */
+            if (!nes->frame_mode) {
+                if (nes->frame_counter == steps[3])
+                    nes->frame_irq_set_timer = 3;
+                if (nes->frame_irq_set_timer > 0) {
+                    int last = (nes->frame_irq_set_timer == 1);
+                    frame_irq_assert_cycle(nes, last);
+                    nes->frame_irq_set_timer--;
+                }
+            }
+            if (nes->frame_counter >= steps[5])
+                nes->frame_counter = 3;
+        }
 
         update_apu_irq(nes);
 
