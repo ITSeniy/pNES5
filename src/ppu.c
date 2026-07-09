@@ -114,8 +114,12 @@ static void step_cpu_apu_until(struct NES *nes, int target, int nmi_cycle, int *
 
 int render_scanline(struct NES *nes, int y) {
     u8 *line = &nes->screen[y * NES_W];
-    /* File-static: freestanding PS payload stack is tight (_start alone ~1.4KB). */
-    static u8 bg_opaque[NES_W];
+    /*
+     * Must NOT be static/global: the JIT maps shellcode RX (W^X). Writing a
+     * static in the code image faults. Heap (nes->*) and stack are fine —
+     * menu never hit this path; first ROM frame did and crashed.
+     */
+    u8 bg_opaque[NES_W];
     int sp0_overlap = 0;
     for (int x = 0; x < NES_W; x++) { line[x] = nes->palette[0]; bg_opaque[x] = 0; }
 
