@@ -227,6 +227,16 @@ static void begin_vblank(struct NES *nes, int during_cpu_step, int instr_cycle) 
     }
 }
 
+/*
+ * Boundary VBL set (between instructions). Match $2000 enable deferral unless
+ * PC is already on LDA/LDX $2002 (Suppression needs NMI before that load).
+ */
+static void begin_vblank_boundary(struct NES *nes) {
+    begin_vblank(nes, 0, 0);
+    if ((nes->ppu_ctrl & 0x80) && !abs_load_is_ppu_status(nes))
+        nes->nmi_delay = 1;
+}
+
 /* VBlank period without status bit / NMI (same-cycle $2002 race). */
 static void begin_vblank_suppressed(struct NES *nes) {
     nes->in_vblank = 1;
@@ -241,11 +251,6 @@ static void end_vblank(struct NES *nes) {
     /* Same instant as pre-render: clear VBlank + sprite0 + overflow. */
     nes->ppu_status &= ~0xE0;
     nes->in_vblank = 0;
-    /*
-     * NMI is edge-latched in the CPU: clearing VBlank drops the PPU NMI
-     * line but does not un-latch an edge that already occurred. Leave
-     * nmi_pending alone so NMI-at-VBL-end still fires after enable.
-     */
 }
 
 /*
@@ -266,7 +271,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
                               int clr_cycle, int *clr_done,
                               int vbl_phase) {
     if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
-        begin_vblank(nes, 0, 0);
+        begin_vblank_boundary(nes);
         *nmi_done = 1;
     }
     if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
@@ -349,7 +354,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
             *nmi_done = 1;
         }
         if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
-            begin_vblank(nes, 0, 0);
+            begin_vblank_boundary(nes);
             *nmi_done = 1;
         }
         if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
@@ -358,7 +363,7 @@ static void step_cpu_apu_until(struct NES *nes, int target,
         }
     }
     if (nmi_done && !*nmi_done && nmi_cycle >= 0 && nes->cycles >= nmi_cycle) {
-        begin_vblank(nes, 0, 0);
+        begin_vblank_boundary(nes);
         *nmi_done = 1;
     }
     if (clr_done && !*clr_done && clr_cycle >= 0 && nes->cycles >= clr_cycle) {
