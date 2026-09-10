@@ -50,12 +50,13 @@ static int  page_cross(u16 a, u16 b)      { return (a & 0xFF00) != (b & 0xFF00);
         xp = page_cross(old_pc, new_pc); \
         (void)cpu_read(nes, old_pc); \
         if (xp) { \
+            /* Page-cross branches poll again after cycle 3. */ \
+            nes->irq_latched = (nes->irq_pending || nes->apu_irq_pending) \
+                && !(nes->flags & F_I); \
             u16 wrong = (u16)((old_pc & 0xFF00) | (new_pc & 0xFF)); \
             (void)cpu_read(nes, wrong); \
-            nes->prev_irq_inhibit = nes->flags & F_I; \
         } else { \
             /* Last-cycle poll skipped: delay IRQ/NMI by one instruction. */ \
-            nes->prev_irq_inhibit = F_I; \
             if (nes->nmi_pending && !nes->nmi_delay) \
                 nes->nmi_delay = 1; \
         } \
@@ -183,9 +184,20 @@ void cpu_step(struct NES *nes) {
     u8 nmi_blocked = 0;
     u8 nmi_overlaps = 0;
     u8 nmi_overlap_cycle = 0;
+    u8 irq_accepted = nes->irq_latched;
+    nes->irq_latched = 0;
     if (nes->nmi_delay) {
         nes->nmi_delay--;
         nmi_blocked = 1;
+        /*
+         * A boundary-delayed NMI can still steal an IRQ vector already
+         * selected by the preceding poll. Treat it as the earliest overlap;
+         * otherwise it runs after IRQ with I set (AccuracyCoin slot 6).
+         */
+        if (irq_accepted && nes->nmi_pending) {
+            nmi_overlaps = 1;
+            nmi_overlap_cycle = 1;
+        }
     }
     if (nes->nmi_in_instr) {
         nmi_overlaps = nes->nmi_pending;
@@ -208,7 +220,7 @@ void cpu_step(struct NES *nes) {
     }
     if (!nes->nmi_pending) nes->prev_nmi_line = 0;
 
-    if ((nes->irq_pending || nes->apu_irq_pending) && !nes->prev_irq_inhibit) {
+    if (irq_accepted) {
         /*
          * Same hijack window as BRK: NMI during early IRQ vectoring steals the
          * vector; late NMI is delayed until after the IRQ sequence (AccuracyCoin
@@ -218,7 +230,8 @@ void cpu_step(struct NES *nes) {
         push16(nes, nes->pc);
         push8(nes, (nes->flags | F_U) & ~F_B);
         nes->flags |= F_I;
-        if (nmi_overlaps && nmi_overlap_cycle <= 5) {
+        /* IRQ's vector-steal window closes one cycle before BRK's. */
+        if (nmi_overlaps && nmi_overlap_cycle <= 4) {
             nes->nmi_pending = 0;
             nes->prev_nmi_line = 1;
             vector = 0xFFFA;
@@ -236,12 +249,19 @@ void cpu_step(struct NES *nes) {
     nes->prev_irq_inhibit = nes->flags & F_I;
 
     u8 op = cpu_read(nes, nes->pc++);
+    /*
+     * Keep the poll result stable until the next instruction. Re-reading the
+     * live line there is too late when DMA or an I/O dummy changes IRQ after
+     * the poll (AccuracyCoin Interrupt Flag Latency E).
+     */
+    nes->irq_latched = (nes->irq_pending || nes->apu_irq_pending)
+        && !(nes->flags & F_I);
     u16 addr = 0, t16;
     u8 val, t8;
     int xp = 0;
 
     switch (op) {
-    case 0x00: nes->pc++; push16(nes,nes->pc); push8(nes,nes->flags|F_B|F_U); nes->flags|=F_I; if(nmi_overlaps&&nmi_overlap_cycle<=5){nes->nmi_pending=0; nes->prev_nmi_line=1; nes->pc=cpu_read16(nes,0xFFFA);}else{if(nmi_overlaps)nes->nmi_delay=1; nes->pc=cpu_read16(nes,0xFFFE);} nes->cycles+=7; return;
+    case 0x00: nes->irq_latched=0; nes->pc++; push16(nes,nes->pc); push8(nes,nes->flags|F_B|F_U); nes->flags|=F_I; if(nmi_overlaps&&nmi_overlap_cycle<=5){nes->nmi_pending=0; nes->prev_nmi_line=1; nes->pc=cpu_read16(nes,0xFFFA);}else{if(nmi_overlaps)nes->nmi_delay=1; nes->pc=cpu_read16(nes,0xFFFE);} nes->cycles+=7; return;
     case 0x01: nes->a|=cpu_read(nes,IZX()); SET_ZN(nes->a); nes->cycles+=6; return;
     case 0x02: nes->pc--; nes->cycles+=2; return;
     case 0x03: addr=IZX(); val=rmw_asl(nes,addr); nes->a|=val; SET_ZN(nes->a); nes->cycles+=8; return;
@@ -342,7 +362,7 @@ void cpu_step(struct NES *nes) {
     case 0x3E: addr=ABX_W(); val=rmw_rol(nes,addr); nes->cycles+=7; return;
     case 0x3F: addr=ABX_W(); val=rmw_rol(nes,addr); nes->a&=val; SET_ZN(nes->a); nes->cycles+=7; return;
 
-    case 0x40: (void)cpu_read(nes, nes->pc); (void)cpu_read(nes, (u16)(0x100 | nes->sp)); nes->flags=(pull8(nes)&~(F_B|F_U))|F_U; nes->pc=pull16(nes); nes->cycles+=6; nes->prev_irq_inhibit=nes->flags&F_I; return;
+    case 0x40: (void)cpu_read(nes, nes->pc); (void)cpu_read(nes, (u16)(0x100 | nes->sp)); nes->flags=(pull8(nes)&~(F_B|F_U))|F_U; nes->pc=pull16(nes); nes->cycles+=6; nes->prev_irq_inhibit=nes->flags&F_I; nes->irq_latched=(nes->irq_pending||nes->apu_irq_pending)&&!(nes->flags&F_I); return;
     case 0x41: nes->a^=cpu_read(nes,IZX()); SET_ZN(nes->a); nes->cycles+=6; return;
     case 0x42: nes->pc--; nes->cycles+=2; return;
     case 0x43: addr=IZX(); val=rmw_lsr(nes,addr); nes->a^=val; SET_ZN(nes->a); nes->cycles+=8; return;

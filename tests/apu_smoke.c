@@ -112,11 +112,37 @@ static int test_pulse_sweep_disabled_outputs(void) {
     return expect_int("pulse disabled sweep still audible", peak > 0, 1);
 }
 
+static int test_audio_ring_producer(void) {
+    struct NES nes;
+    memset(&nes, 0, sizeof(nes));
+    init_ntsc_frame_steps(&nes);
+    nes.audio_thread_running = 1;
+    nes.audio_read_pos = 0;
+    nes.audio_write_pos = AUDIO_PRIME_BUFS * SAMPLES_PER_BUF;
+
+    apu_step(&nes, 2000);
+    int fails = 0;
+    fails += expect_int("audio ring receives samples",
+                        nes.audio_write_pos > AUDIO_PRIME_BUFS * SAMPLES_PER_BUF, 1);
+    fails += expect_int("threaded audio bypasses linear capture", nes.audio_pos, 0);
+
+    memset(&nes, 0, sizeof(nes));
+    init_ntsc_frame_steps(&nes);
+    nes.audio_thread_running = 1;
+    nes.audio_write_pos = AUDIO_RING_FRAMES;
+    apu_step(&nes, 200);
+    fails += expect_int("full audio ring is not overwritten",
+                        nes.audio_write_pos, AUDIO_RING_FRAMES);
+    fails += expect_int("audio ring overrun is counted", nes.audio_overruns > 0, 1);
+    return fails;
+}
+
 int main(void) {
     int fails = 0;
     fails += test_frame_irq();
     fails += test_dmc_registers();
     fails += test_pulse_sweep_disabled_outputs();
+    fails += test_audio_ring_producer();
 
     if (fails) {
         printf("apu_smoke: %d failure(s)\n", fails);

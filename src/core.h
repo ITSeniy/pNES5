@@ -43,6 +43,7 @@ typedef signed char    s8;
  * the main loop is vsync-locked; 512 (~10.7 ms) is far more stable on PS5.
  */
 #define SAMPLES_PER_BUF 512
+#define AUDIO_RING_FRAMES 4096
 /* Silence buffers queued before gameplay so the AudioOut ring has headroom. */
 #define AUDIO_PRIME_BUFS 4
 #define AUDIO_S16_STEREO 1

@@ -99,10 +99,9 @@ static void test_4016_contiguous_oe(void) {
     nes.dmc.halt_addr = 0x4016;
     /* Use cpu_read which services */
     u8 a = cpu_read(&nes, 0x4016);
-    /* First clock got bit0=1, dummies re-read same bit, final same */
-    expect_u8("DMA+$4016 first bit is A", (u8)(a & 1), 1);
-    /* Shift advanced only once during whole DMA+read */
-    expect_u8("pad_shift after one OE", nes.pad_shift, 0x80); /* after one clock empty → 0x80 fill */
+    /* Dummies clock A once; the completing CPU read clocks the next bit. */
+    expect_u8("DMA+$4016 completing read is B", (u8)(a & 1), 0);
+    expect_u8("pad_shift after double-read", nes.pad_shift, 0xC0);
 
     /* Second read outside DMA clocks again */
     a = cpu_read(&nes, 0x4016);

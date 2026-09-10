@@ -7,6 +7,7 @@
  * gcc -O2 -Isrc tests/cpu_behavior2_smoke.c src/bus.c src/mapper.c src/cpu.c src/ppu.c src/apu.c -o tests/cpu_behavior2_smoke
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "nes.h"
 #include "mapper.h"

@@ -72,6 +72,39 @@ static int is_io_side_effect_addr(u16 addr) {
     return 0;
 }
 
+/* Side-effect-free instruction-stream byte for DMA look-ahead. */
+static u8 cpu_code_peek(struct NES *nes, u16 addr) {
+    if (addr < 0x2000)
+        return nes->ram[addr & 0x7FF];
+    if (addr >= 0x8000)
+        return mapper_prg_read(nes, addr);
+    return nes->cpu_data_bus;
+}
+
+/*
+ * AccuracyCoin aligns a reload request between the opcode and operands of an
+ * absolute I/O access. RDY must reach the actual data cycle for reads, while
+ * a following write cannot be halted and moves the DMA to the next read.
+ *
+ * Only bridge the opcode/operand fetches of the known side-effect ports. A broad
+ * stream delay also bridges branches/clockslides and breaks DMASync residuals.
+ */
+static int dmc_defer_io_operand(struct NES *nes, u16 addr) {
+    u16 pc = nes->pc;
+    if (addr != (u16)(pc - 1) && addr != pc && addr != (u16)(pc + 1))
+        return 0;
+
+    u8 op = cpu_code_peek(nes, (u16)(pc - 1));
+    if (op != 0xAD && op != 0x2C && op != 0x8D) /* LDA/BIT/STA abs */
+        return 0;
+
+    u16 target = (u16)(cpu_code_peek(nes, pc)
+        | ((u16)cpu_code_peek(nes, (u16)(pc + 1)) << 8));
+    if (target >= 0x2000 && target < 0x4000)
+        return (target & 7) == 7; /* $2007 and mirrors */
+    return op != 0x8D && (target == 0x4015 || target == 0x4016);
+}
+
 /*
  * Side-effecting CPU read without DMC service / timer tick.
  * DMC halt/dummy/alignment cycles re-issue this path on the halted address.
@@ -169,18 +202,15 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
     } else if (addr == 0x4016) {
         /*
          * During DMC halt/dummy cycles (dma_reentry), re-reads of $4016 form
-         * one contiguous OE: NES/AV Famicom clock once; subsequent dummies
-         * return the same bit (AccuracyCoin DMA+$4016). The CPU's completing
-         * data cycle after DMA is still that same OE (joy_oe_hold) — an extra
-         * clock here broke DMA+$4016 (shift advanced twice per LDA).
+         * one contiguous OE, so the dummies clock once. The completing CPU
+         * data cycle is a second OE/clock (AccuracyCoin's NES double-read).
          * Outside DMA, every access clocks (LDA $4016 separated by opcode fetches).
          */
         u8 bit;
         if (nes->pad_strobe)
             nes->pad_shift = nes->pad_state;
-        if ((nes->dmc.dma_reentry || nes->dmc.joy_oe_hold) && nes->joy_oe_addr == addr) {
+        if (nes->dmc.dma_reentry && nes->joy_oe_addr == addr) {
             bit = nes->joy_last_bit;
-            nes->dmc.joy_oe_hold = 0;
         } else {
             bit = (u8)(nes->pad_shift & 1);
             if (!nes->pad_strobe)
@@ -190,8 +220,6 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
         }
         result = (u8)(bit | (nes->cpu_data_bus & 0xFE));
     } else if (addr == 0x4017) {
-        if (nes->dmc.joy_oe_hold && nes->joy_oe_addr == addr)
-            nes->dmc.joy_oe_hold = 0;
         nes->joy_oe_addr = addr;
         result = (u8)(nes->cpu_data_bus & 0xFE);
     } else if (addr >= 0x8000) {
@@ -207,6 +235,22 @@ u8 cpu_read_nodma(struct NES *nes, u16 addr) {
     if (!skip_bus_update)
         cpu_bus_put(nes, result);
     return result;
+}
+
+/*
+ * The OAM reader and the 6502 have separate internal address buses. The
+ * readable APU registers are decoded only when the halted 6502 address bus is
+ * in $4000-$401F. Once enabled, the OAM address supplies the low five bits,
+ * exposing the otherwise unreachable $20-byte APU mirrors.
+ */
+static u8 oam_dma_read(struct NES *nes, u16 addr, int apu_active) {
+    if ((addr & 0xFF00) == 0x4000) {
+        u16 reg = (u16)(0x4000 | (addr & 0x1F));
+        if (apu_active && reg >= 0x4015 && reg <= 0x4017)
+            return cpu_read_nodma(nes, reg);
+        return nes->cpu_data_bus;
+    }
+    return cpu_read_nodma(nes, addr);
 }
 
 /* Legacy no-op — dummies go through cpu_read_nodma now. */
@@ -232,6 +276,9 @@ u8 cpu_read(struct NES *nes, u16 addr) {
     if (nes->dmc.dma_pending && !nes->dmc.dma_reentry) {
         if (nes->dmc.dma_halt_delay > 0 && !nes->dmc.dma_abort) {
             nes->dmc.dma_halt_delay--;
+        } else if (!nes->dmc.dma_is_load && !nes->dmc.dma_abort
+                   && dmc_defer_io_operand(nes, addr)) {
+            /* Keep RDY pending through opcode/ADL/ADH; use data/next read. */
         } else {
             nes->dmc.stream_defer = 0;
             nes->dmc.halt_addr = addr;
@@ -376,6 +423,13 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
          * starts on a get cycle (AccuracyCoin APU get/put sync).
          */
         u16 base = (u16)val << 8;
+        u16 halted_cpu_addr = nes->pc;
+        int apu_active = halted_cpu_addr >= 0x4000
+            && halted_cpu_addr <= 0x401F;
+        if (val == 0x40 || apu_active) {
+            nes->dma_read_addr = halted_cpu_addr; /* retained host diagnostic */
+            nes->dma_read_suppress = val;
+        }
         int odd = (nes->total_cycles + nes->dmc.ticks_exec) & 1;
         nes->dmc.oam_dma_active = 1;
         nes->cycles += 1;
@@ -391,7 +445,7 @@ void cpu_write(struct NES *nes, u16 addr, u8 val) {
                 dmc_service_dma(nes);
             }
             apu_on_cpu_cycle_begin(nes);
-            u8 b = cpu_read_nodma(nes, (u16)(base + i));
+            u8 b = oam_dma_read(nes, (u16)(base + i), apu_active);
             nes->oam[(nes->oam_addr + i) & 0xFF] = b;
             nes->cycles += 2;
             dmc_tick(nes);

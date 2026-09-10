@@ -576,6 +576,30 @@ static int test_four_screen_mirroring(void) {
     return fails;
 }
 
+static int test_oam_dma_apu_activation(void) {
+    struct NES nes;
+    memset(&nes, 0, sizeof(nes));
+    nes.pc = 0x8000; /* halted 6502 address bus is outside the APU window */
+    nes.cpu_data_bus = 0x40;
+    nes.cpu_db_internal = 0x40;
+    nes.frame_irq_flag = 1;
+    cpu_write(&nes, 0x4014, 0x40);
+    int fails = expect_int("OAM inactive APU keeps IRQ clear unscheduled",
+                           nes.frame_irq_clear_pending, 0);
+    fails += expect_u8("OAM inactive $4015 is open bus", nes.oam[0x15], 0x40);
+
+    memset(&nes, 0, sizeof(nes));
+    nes.pc = 0x4001; /* AccuracyCoin executes STA $4014 from $3FFE */
+    nes.cpu_data_bus = 0x40;
+    nes.cpu_db_internal = 0x40;
+    nes.frame_irq_flag = 1;
+    cpu_write(&nes, 0x4014, 0x40);
+    fails += expect_int("OAM active APU reads $4015",
+                        nes.frame_irq_clear_pending, 1);
+    fails += expect_u8("OAM active $4015 status", nes.oam[0x15] & 0x40, 0x40);
+    return fails;
+}
+
 int main(void) {
     int fails = 0;
     fails += test_controller_strobe();
@@ -595,6 +619,7 @@ int main(void) {
     fails += test_mapper185_chr_disable();
     fails += test_mapper_nina_and_cprom();
     fails += test_four_screen_mirroring();
+    fails += test_oam_dma_apu_activation();
 
     if (fails) {
         printf("core_smoke: %d failure(s)\n", fails);

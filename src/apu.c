@@ -361,8 +361,6 @@ void dmc_service_dma(struct NES *nes) {
             nes->dmc.sample_buf = sample;
             nes->dmc.sample_buf_full = 1;
             nes->dmc.bus_hold_ttl = 2;
-            if (halt == 0x4016 || halt == 0x4017)
-                nes->dmc.joy_oe_hold = 1;
         }
         nes->dmc.dma_is_load = 0;
     } else {
@@ -383,8 +381,6 @@ void dmc_service_dma(struct NES *nes) {
             nes->dmc.sample_buf = sample;
             nes->dmc.sample_buf_full = 1;
             nes->dmc.bus_hold_ttl = 2;
-            if (halt == 0x4016 || halt == 0x4017)
-                nes->dmc.joy_oe_hold = 1;
         }
     }
 
@@ -411,7 +407,7 @@ void dmc_service_dma(struct NES *nes) {
              * 1-byte) can leave a 1-cycle aborted reload (AccuracyCoin).
              * Reload sample ends must NOT do this — that broke DMASync phase.
              */
-            if (was_load || race) {
+            if (race) {
                 nes->dmc.dma_pending = 1;
                 nes->dmc.dma_abort = 1;
                 nes->dmc.dma_halt_delay = 0;
@@ -534,17 +530,12 @@ void apu_write_reg(struct NES *nes, u16 addr, u8 val) {
              * stole a cycle on every $4015 clear and broke DMA phase).
              * Abort cannot halt on this write; it runs on the next read.
              */
-            if (nes->dmc.dma_pending) {
-                nes->dmc.dma_abort = 1;
-                nes->dmc.dma_halt_delay = 0;
-            } else {
-                nes->dmc.dma_abort = 0;
-            }
+            if (nes->dmc.dma_pending && !nes->dmc.dma_abort)
+                nes->dmc.dma_pending = 0;
+            nes->dmc.dma_abort = 0;
             nes->dmc.bytes_left = 0;
             nes->dmc.dma_is_load = 0;
-            /* dma_pending kept if abort, else clear */
-            if (!nes->dmc.dma_abort)
-                nes->dmc.dma_pending = 0;
+            nes->dmc.dma_pending = 0;
         } else if (nes->dmc.bytes_left == 0) {
             /*
              * Load DMA: schedule only — halt after dma_halt_delay reads.
@@ -685,6 +676,15 @@ void apu_step(struct NES *nes, int cycles) {
          * PAL_SAMPLE_DIV) so vsync-locked playback does not underrun AudioOut.
          */
         s32 sample_div = nes->is_pal ? (s32)PAL_SAMPLE_DIV : (s32)NTSC_SAMPLE_DIV;
+        if (nes->audio_thread_running) {
+            u32 rd = __atomic_load_n(&nes->audio_read_pos, __ATOMIC_ACQUIRE);
+            u32 wr = __atomic_load_n(&nes->audio_write_pos, __ATOMIC_RELAXED);
+            s32 fill = (s32)(wr - rd);
+            s32 correction = (fill - AUDIO_PRIME_BUFS * SAMPLES_PER_BUF) * 4;
+            if (correction > 9000) correction = 9000;
+            if (correction < -9000) correction = -9000;
+            sample_div += correction;
+        }
         nes->sample_acc += SAMPLE_RATE;
         if (nes->sample_acc >= sample_div) {
             nes->sample_acc -= sample_div;
@@ -719,7 +719,18 @@ void apu_step(struct NES *nes, int cycles) {
             nes->hpf_out = hp;
 
             s16 sample = (s16)(hp > 32767 ? 32767 : (hp < -32768 ? -32768 : hp));
-            if (nes->audio_pos < 2048) {
+            if (nes->audio_thread_running) {
+                u32 wr = __atomic_load_n(&nes->audio_write_pos, __ATOMIC_RELAXED);
+                u32 rd = __atomic_load_n(&nes->audio_read_pos, __ATOMIC_ACQUIRE);
+                if (wr - rd < AUDIO_RING_FRAMES) {
+                    u32 pos = (wr & (AUDIO_RING_FRAMES - 1)) * 2;
+                    nes->audio_buf[pos] = sample;
+                    nes->audio_buf[pos + 1] = sample;
+                    __atomic_store_n(&nes->audio_write_pos, wr + 1, __ATOMIC_RELEASE);
+                } else {
+                    __atomic_add_fetch(&nes->audio_overruns, 1, __ATOMIC_RELAXED);
+                }
+            } else if (nes->audio_pos < AUDIO_RING_FRAMES) {
                 nes->audio_buf[nes->audio_pos * 2] = sample;
                 nes->audio_buf[nes->audio_pos * 2 + 1] = sample;
                 nes->audio_pos++;
@@ -731,6 +742,7 @@ void apu_step(struct NES *nes, int cycles) {
 
 void apu_flush(struct NES *nes) {
     if (nes->audio_handle < 0 || !nes->audio_out_fn) return;
+    if (nes->audio_thread_running) return;
     while (nes->audio_pos >= SAMPLES_PER_BUF) {
         /* sceAudioOutOutput blocks until the grain is queued (and copies it). */
         NC(nes->gadget, nes->audio_out_fn,
@@ -745,14 +757,23 @@ void apu_flush(struct NES *nes) {
 void apu_prime(struct NES *nes, int buffers) {
     if (nes->audio_handle < 0 || !nes->audio_out_fn) return;
 
-    for (int i = 0; i < SAMPLES_PER_BUF * 2; i++)
-        nes->audio_buf[i] = 0;
-
     if (buffers < 1) buffers = 1;
-    if (buffers > 8) buffers = 8;
-    for (int i = 0; i < buffers; i++) {
-        NC(nes->gadget, nes->audio_out_fn,
-           (u64)nes->audio_handle, (u64)nes->audio_buf, 0, 0, 0, 0);
+    if (buffers > AUDIO_RING_FRAMES / SAMPLES_PER_BUF)
+        buffers = AUDIO_RING_FRAMES / SAMPLES_PER_BUF;
+
+    if (nes->audio_thread_running) {
+        u32 rd = __atomic_load_n(&nes->audio_read_pos, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < AUDIO_RING_FRAMES * 2; i++)
+            nes->audio_buf[i] = 0;
+        __atomic_store_n(&nes->audio_write_pos,
+                         rd + (u32)(buffers * SAMPLES_PER_BUF), __ATOMIC_RELEASE);
+    } else {
+        for (int i = 0; i < SAMPLES_PER_BUF * 2; i++)
+            nes->audio_buf[i] = 0;
+        for (int i = 0; i < buffers; i++) {
+            NC(nes->gadget, nes->audio_out_fn,
+               (u64)nes->audio_handle, (u64)nes->audio_buf, 0, 0, 0, 0);
+        }
     }
 
     nes->audio_pos = 0;
@@ -760,4 +781,26 @@ void apu_prime(struct NES *nes, int buffers) {
     nes->lpf_prev = 0;
     nes->hpf_in = 0;
     nes->hpf_out = 0;
+}
+
+void *apu_audio_thread(void *arg) {
+    struct NES *nes = (struct NES *)arg;
+    while (!__atomic_load_n(&nes->audio_thread_stop, __ATOMIC_ACQUIRE)) {
+        u32 rd = __atomic_load_n(&nes->audio_read_pos, __ATOMIC_RELAXED);
+        u32 wr = __atomic_load_n(&nes->audio_write_pos, __ATOMIC_ACQUIRE);
+        int have_audio = (wr - rd) >= SAMPLES_PER_BUF;
+        s16 *buf = nes->audio_silence;
+        if (have_audio)
+            buf = &nes->audio_buf[(rd & (AUDIO_RING_FRAMES - 1)) * 2];
+        else if (nes->rom_loaded)
+            __atomic_add_fetch(&nes->audio_underruns, 1, __ATOMIC_RELAXED);
+
+        NC(nes->gadget, nes->audio_out_fn,
+           (u64)nes->audio_handle, (u64)buf, 0, 0, 0, 0);
+
+        if (have_audio)
+            __atomic_store_n(&nes->audio_read_pos,
+                             rd + SAMPLES_PER_BUF, __ATOMIC_RELEASE);
+    }
+    return 0;
 }

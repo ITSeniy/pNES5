@@ -234,6 +234,34 @@ static void test_sprite_zero_geom(struct NES *nes) {
     expect_nz("attributes as tiles sprite zero", nes->ppu_status & 0x40);
 }
 
+static void test_sprite_clipping_priority(struct NES *nes) {
+    printf("\n--- Sprite clipping / priority ---\n");
+    memset(nes->vram, 0, sizeof(nes->vram));
+    memset(nes->oam, 0xFF, sizeof(nes->oam));
+    memset(nes->chr, 0, (size_t)nes->chr_size);
+    nes->chr[0] = 0x80;      /* BG tile 0, row 0, left pixel opaque */
+    nes->chr[16] = 0x80;     /* Sprite tile 1, row 0, left pixel opaque */
+    nes->palette[0] = 0x00;
+    nes->palette[1] = 0x11;
+    nes->palette[17] = 0x22;
+    nes->ppu_ctrl = 0;
+    nes->fine_x = 0;
+    nes->vram_addr = 0;
+
+    nes->oam[0] = 0;
+    nes->oam[1] = 1;
+    nes->oam[2] = 0;
+    nes->oam[3] = 0;
+    nes->ppu_mask = 0x14; /* sprites + sprite-left; BG and BG-left disabled */
+    render_scanline(nes, 1);
+    expect_u8("sprite survives independent BG-left clip", nes->screen[256], 0x22);
+
+    nes->oam[2] = 0x20; /* behind BG, but BG output is disabled */
+    nes->oam[3] = 16;
+    render_scanline(nes, 1);
+    expect_u8("behind-BG sprite visible while BG disabled", nes->screen[256 + 16], 0x22);
+}
+
 int main(int argc, char **argv) {
     const char *rom = argc > 1 ? argv[1] : "roms/AccuracyCoin.nes";
     struct NES nes;
@@ -247,6 +275,7 @@ int main(int argc, char **argv) {
 
     test_read_buffer(&nes);
     test_sprite_zero_geom(&nes);
+    test_sprite_clipping_priority(&nes);
 
     free(nes.prg);
     free(nes.chr);

@@ -6,6 +6,25 @@
 #include "mapper.h"
 #include "tables.h"
 
+#ifdef DMC_TRACE
+void dmc_phase_log_service(struct NES *nes, u16 halt, int stall) {
+    static int lines;
+    if (lines >= 256 || nes->ram[0x14] != 0x0C || nes->ram[0x16] != 7)
+        return;
+    fprintf(stderr,
+            "DMA test=%02X err=%02X x=%02X pc=%04X halt=%04X stall=%d cyc=%d total=%d "
+            "v=%04X buf=%02X a=%02X pend=%u load=%u abort=%u bits=%u timer=%u "
+            "pad=%02X last=%u hold=%u oe=%04X\n",
+            nes->ram[0x16], nes->ram[0x10], nes->x, nes->pc, halt, stall,
+            nes->cycles, nes->total_cycles, nes->vram_addr, nes->read_buf,
+            nes->a, nes->dmc.dma_pending, nes->dmc.dma_is_load,
+            nes->dmc.dma_abort, nes->dmc.bits_left, nes->dmc.timer_count,
+            nes->pad_shift, nes->joy_last_bit, nes->dmc.joy_oe_hold,
+            nes->joy_oe_addr);
+    lines++;
+}
+#endif
+
 static void init_ntsc(struct NES *nes) {
     nes->is_pal = 0;
     nes->cpu_freq = 1789773;
@@ -254,7 +273,7 @@ static void close_wav(FILE *f, u32 data_bytes) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s ROM [--frames N] [--steps N] [--nestest] [--pc HEX] [--expect-pass] [--dump-ppm PATH] [--dump-wav PATH] [--pad-event FRAME:HEX]\n"
+        "usage: %s ROM [--frames N] [--steps N] [--nestest] [--pc HEX] [--call-event FRAME:HEX] [--expect-pass] [--dump-ppm PATH] [--dump-wav PATH] [--pad-event FRAME:HEX]\n"
         "  blargg-style tests: run frames, then read $6000 and message at $6004\n"
         "  nestest smoke: use --nestest --steps N to start at $C000 and print final CPU state\n",
         argv0);
@@ -272,6 +291,8 @@ int main(int argc, char **argv) {
     int expect_pass = 0;
     int override_pc = -1;
     int debug_state = 0;
+    int call_frame = -1;
+    int call_pc = -1;
     const char *dump_path = 0;
     const char *wav_path = 0;
     struct pad_event pad_events[64];
@@ -296,6 +317,15 @@ int main(int argc, char **argv) {
             wav_path = argv[++i];
         } else if (!strcmp(argv[i], "--debug-state")) {
             debug_state = 1;
+        } else if (!strcmp(argv[i], "--call-event") && i + 1 < argc) {
+            char *sep = strchr(argv[++i], ':');
+            if (!sep) {
+                usage(argv[0]);
+                return 2;
+            }
+            *sep = 0;
+            call_frame = parse_int_arg(argv[i], -1);
+            call_pc = (int)strtol(sep + 1, 0, 16);
         } else if (!strcmp(argv[i], "--pad-event") && i + 1 < argc) {
             if (pad_event_count >= 64 || !parse_pad_event(argv[++i], &pad_events[pad_event_count++])) {
                 usage(argv[0]);
@@ -327,11 +357,32 @@ int main(int argc, char **argv) {
     if (!nestest) {
         FILE *wav = wav_path ? open_wav(wav_path) : 0;
         u32 wav_bytes = 0;
+        u8 accuracycoin_dma_snap[3][96] = {{0}};
         for (int i = 0; i < frames; i++) {
+            if (i == call_frame && call_pc >= 0) {
+                /* Invoke a ROM test subroutine from the live menu and return
+                 * to the exact instruction boundary at which it was injected. */
+                u16 ret = (u16)(nes.pc - 1);
+                nes.ram[0x100 | nes.sp--] = (u8)(ret >> 8);
+                nes.ram[0x100 | nes.sp--] = (u8)ret;
+                nes.pc = (u16)call_pc;
+            }
             for (int e = 0; e < pad_event_count; e++)
                 if (pad_events[e].frame == i)
                     nes.pad_state = pad_events[e].state;
             run_frame(&nes);
+            if (nes.ram[0x14] == 0x0C && nes.ram[0x16] >= 7 && nes.ram[0x16] <= 9) {
+                int slot = nes.ram[0x16] - 7;
+                int nonzero = 0;
+                for (int j = 0; j < 32; j++)
+                    nonzero |= nes.ram[0x50 + j];
+                for (int j = 0; j < 64; j++)
+                    nonzero |= nes.ram[0x500 + j];
+                if (nonzero) {
+                    memcpy(accuracycoin_dma_snap[slot], &nes.ram[0x50], 32);
+                    memcpy(accuracycoin_dma_snap[slot] + 32, &nes.ram[0x500], 64);
+                }
+            }
             write_wav_samples(wav, &nes, &wav_bytes);
         }
         close_wav(wav, wav_bytes);
@@ -344,6 +395,9 @@ int main(int argc, char **argv) {
         if (debug_state) {
             printf("state: PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X CYC=%d TOTAL=%d\n",
                    nes.pc, nes.a, nes.x, nes.y, nes.flags, nes.sp, nes.cycles, nes.total_cycles);
+            printf("bus: data=%02X internal=%02X last-oam-base=%02X cpu=%04X\n",
+                   nes.cpu_data_bus, nes.cpu_db_internal,
+                   nes.dma_read_suppress, nes.dma_read_addr);
             printf("ppu: ctrl=%02X mask=%02X status=%02X v=%04X t=%04X fine=%u odd=%u overrun=%d rem=%d\n",
                    nes.ppu_ctrl, nes.ppu_mask, nes.ppu_status, nes.vram_addr, nes.temp_addr,
                    nes.fine_x, nes.odd_frame, nes.frame_cpu_overrun, nes.frame_cycle_rem);
@@ -356,6 +410,38 @@ int main(int argc, char **argv) {
                    nes.ram[0x1C], nes.ram[0x1D], nes.ram[0x1E], nes.ram[0x1F],
                    nes.ram[0x20], nes.ram[0x21], nes.ram[0x22], nes.ram[0x35],
                    nes.ram[0x36], nes.ram[0x37], nes.ram[0x38], nes.ram[0xEF]);
+            printf("accuracycoin: err=%02X menu=%02X/%02X results=%02X,%02X,%02X page5=",
+                   nes.ram[0x10], nes.ram[0x14], nes.ram[0x16],
+                   nes.ram[0x461], nes.ram[0x462], nes.ram[0x463]);
+            for (int i = 0; i < 0x20; i++)
+                printf("%02X%s", nes.ram[0x500 + i], i == 0x1F ? "\n" : " ");
+            printf("accuracycoin-dma: open=%02X 2002r=%02X 2007r=%02X 2007w=%02X "
+                   "4015r=%02X 4016r=%02X conflict=%02X dmc-oam=%02X abort=%02X/%02X\n",
+                   nes.ram[0x46C], nes.ram[0x488], nes.ram[0x44C], nes.ram[0x44F],
+                   nes.ram[0x45D], nes.ram[0x45E], nes.ram[0x46B], nes.ram[0x477],
+                   nes.ram[0x479], nes.ram[0x478]);
+            printf("accuracycoin-apu: length=%02X table=%02X frame-irq=%02X "
+                   "4step=%02X 5step=%02X dmc=%02X activation=%02X controllers=%02X/%02X\n",
+                   nes.ram[0x465], nes.ram[0x466], nes.ram[0x467],
+                   nes.ram[0x468], nes.ram[0x469], nes.ram[0x46A],
+                   nes.ram[0x45C], nes.ram[0x45F], nes.ram[0x47A]);
+            printf("accuracycoin-dma-zp:");
+            for (int i = 0x50; i < 0x70; i++)
+                printf(" %02X", nes.ram[i]);
+            putchar('\n');
+            for (int s = 0; s < 3; s++) {
+                printf("accuracycoin-dma-snap-%d:", s + 7);
+                for (int j = 0; j < 96; j++)
+                    printf(" %02X", accuracycoin_dma_snap[s][j]);
+                putchar('\n');
+            }
+            printf("accuracycoin-page5:");
+            for (int i = 0; i < 0x100; i++) {
+                if ((i & 0x0F) == 0)
+                    printf("\n%02X:", i);
+                printf(" %02X", nes.ram[0x500 + i]);
+            }
+            putchar('\n');
             printf("apu: p0(en=%u len=%u duty=%u vol=%u const=%u halt=%u sw=%u neg=%u sh=%u per=%u t=%u pos=%u) "
                    "p1(en=%u len=%u duty=%u vol=%u const=%u halt=%u sw=%u neg=%u sh=%u per=%u t=%u pos=%u) "
                    "tri(en=%u len=%u lin=%u reload=%u ctl=%u load=%u t=%u step=%u) "

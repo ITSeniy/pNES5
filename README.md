@@ -140,3 +140,9 @@ Optional UDP log: set `PC_IP` in `nes.lua`, then `nc -u -l -p 9027` or `python p
 ## Disclaimer
 
 Research / educational use only. Use at your own risk.
+
+## Русский
+
+pNES5 — эмулятор NES для PS5 в виде нативного x86-64 shellcode, запускаемого через LuaC0re.
+
+MIT относится только к авторскому коду; лицензии сторонних компонентов сохраняются.

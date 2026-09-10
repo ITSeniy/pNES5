@@ -168,7 +168,7 @@ struct NES {
     u8  joy_last_bit;
     u8  dma_read_pending, dma_read_suppress; /* legacy; unused */
     u16 dma_read_addr;
-    u8  irq_pending, prev_irq_inhibit, apu_irq_pending;
+    u8  irq_pending, prev_irq_inhibit, apu_irq_pending, irq_latched;
 
     struct pulse_ch    pulse[2];
     struct triangle_ch tri;
@@ -193,8 +193,17 @@ struct NES {
     s32 frame_counter, sample_acc;
     s32 fc_step[2][6];
 
-    s16 audio_buf[2048 * 2];
+    /*
+     * Single-producer/single-consumer AudioOut ring. The main emulation thread
+     * writes samples; the dedicated audio thread consumes 512-frame grains.
+     * Host tests keep using audio_pos as a linear capture buffer.
+     */
+    s16 audio_buf[AUDIO_RING_FRAMES * 2];
+    s16 audio_silence[SAMPLES_PER_BUF * 2];
     s32 audio_pos;
+    volatile u32 audio_read_pos, audio_write_pos;
+    volatile u32 audio_underruns, audio_overruns;
+    volatile u8  audio_thread_running, audio_thread_stop;
     void *gadget;
     void *audio_out_fn;
     s32  audio_handle;
@@ -248,6 +257,7 @@ void apu_write_reg(struct NES *nes, u16 addr, u8 val);
 void apu_step(struct NES *nes, int cycles);
 void apu_flush(struct NES *nes);
 void apu_prime(struct NES *nes, int buffers);
+void *apu_audio_thread(void *arg);
 
 /* ppu.c */
 void draw_char(u8 *scr, int x, int y, char ch, u8 color);

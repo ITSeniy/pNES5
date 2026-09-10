@@ -405,6 +405,7 @@ int render_scanline(struct NES *nes, int y) {
     int any_render = (nes->ppu_mask & 0x18) != 0;
     int show_bg = (nes->ppu_mask & 0x08) != 0;
     int show_spr = (nes->ppu_mask & 0x10) != 0;
+    int bg_clip = !(nes->ppu_mask & 0x02);
     nes->sp0_overlap = 0;
 
     /* OAMADDR forced through 0 during sprite fetch (dots 257–320). */
@@ -432,10 +433,9 @@ int render_scanline(struct NES *nes, int y) {
                 int sx = tile * 8 + px - nes->fine_x;
                 if (sx < 0 || sx >= NES_W) continue;
                 u8 color = ((hi >> (7-px)) & 1) << 1 | ((lo >> (7-px)) & 1);
-                if (color) {
+                if (color && show_bg && !(bg_clip && sx < 8)) {
                     bg_opaque[sx] = 1;
-                    if (show_bg)
-                        line[sx] = nes->palette[pal_idx * 4 + color];
+                    line[sx] = nes->palette[pal_idx * 4 + color];
                 }
             }
 
@@ -514,8 +514,6 @@ int render_scanline(struct NES *nes, int y) {
         }
     }
 
-    if (!(nes->ppu_mask & 0x02))
-        for (int x = 0; x < 8; x++) line[x] = nes->palette[0];
     return nes->sp0_overlap;
 }
 

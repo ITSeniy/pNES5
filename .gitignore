@@ -54,3 +54,109 @@ nes-test-roms-master/
 # Local ROM dumps (keep folder, ignore contents)
 roms/*
 !roms/.gitkeep
+
+# --- Portfolio repository safety defaults ---
+# IDE and OS
+.vs/
+.idea/
+.vscode/*.user
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Build outputs
+bin/
+obj/
+build/
+build-*/
+dist/
+out/
+target/
+Debug/
+Release/
+.next/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+secrets.json
+credentials.json
+config.local.*
+*.private.*
+*.key
+*.pem
+!*.example.pem
+
+# Logs, caches, archives and generated executables
+*.log
+*.tmp
+*.cache
+*.dmp
+*.pdb
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+
+# Proprietary game dumps and extracted runtime data
+*.iso
+*.cue
+*.chd
+*.rom
+*.nes
+*.sfc
+*.smc
+*.gba
+*.gb
+*.xex
+*.pak
+*.wad
+*_Data/
+
+# Large media should be replaced by legal samples or tracked with Git LFS
+*.mkv
+*.mp4
+*.wav
+*.ogg
+*.flac
+
+# Local application state
+saves/
+local-data/
+
+# --- Portfolio large-artifact exclusions ---
+# Generated packages, disk images and ML checkpoints
+*.apk
+*.apk.gz
+*.aab
+*.tar
+*.tar.gz
+*.keras
+*.h5
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.pac
+
+# Generated or locally extracted workspaces
+artifacts/
+output/
+outputs/
+game_content/
+BombRushCyberfunk/
+EvolutionX/
+
+# Temporary Office files
+~$*

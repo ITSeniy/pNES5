@@ -16,7 +16,7 @@
 #define COL_NUM      0x21
 #define ROM_BUF_SIZE 0x400000
 #define STATE_MAGIC 0x30545345u /* EST0 */
-#define STATE_VERSION 12u
+#define STATE_VERSION 13u
 /* Rising-edge meta flags from DualSense (combine with NES buttons; never clobber). */
 #define META_SAVE      0x01
 #define META_LOAD      0x02
@@ -162,7 +162,7 @@ struct nes_state_core {
 
     u8  cpu_data_bus, cpu_db_internal;
     u8  pad_state, pad_shift, pad_strobe, pad_out0;
-    u8  irq_pending, prev_irq_inhibit, apu_irq_pending;
+    u8  irq_pending, prev_irq_inhibit, apu_irq_pending, irq_latched;
     struct pulse_ch    pulse[2];
     struct triangle_ch tri;
     struct noise_ch    noise;
@@ -246,6 +246,7 @@ static void capture_state(struct NES *nes, struct nes_state_core *st) {
     st->pad_strobe = nes->pad_strobe; st->pad_out0 = nes->pad_out0;
     st->irq_pending = nes->irq_pending;
     st->prev_irq_inhibit = nes->prev_irq_inhibit; st->apu_irq_pending = nes->apu_irq_pending;
+    st->irq_latched = nes->irq_latched;
     st->pulse[0] = nes->pulse[0]; st->pulse[1] = nes->pulse[1];
     st->tri = nes->tri; st->noise = nes->noise; st->dmc = nes->dmc;
     st->apu_status = nes->apu_status; st->frame_mode = nes->frame_mode;
@@ -328,7 +329,7 @@ static int restore_state(struct NES *nes, const struct nes_state_core *st) {
     nes->pad_state = 0; nes->pad_shift = st->pad_shift; nes->pad_strobe = st->pad_strobe;
     nes->pad_out0 = st->pad_out0;
     nes->irq_pending = st->irq_pending; nes->prev_irq_inhibit = st->prev_irq_inhibit;
-    nes->apu_irq_pending = st->apu_irq_pending;
+    nes->apu_irq_pending = st->apu_irq_pending; nes->irq_latched = st->irq_latched;
     nes->pulse[0] = st->pulse[0]; nes->pulse[1] = st->pulse[1];
     nes->tri = st->tri; nes->noise = st->noise; nes->dmc = st->dmc;
     nes->apu_status = st->apu_status; nes->frame_mode = st->frame_mode;
@@ -411,6 +412,40 @@ static void nes_reset(struct NES *nes, void *G, void *audio_fn, s32 audio_h) {
     nes->audio_out_fn = audio_fn;
     nes->audio_handle = audio_h;
     nes->noise.shift_reg = 1;
+}
+
+static int start_audio_thread(struct NES *nes, void *G, void *pthread_create,
+                              u64 *thread) {
+    if (!pthread_create || nes->audio_handle < 0 || !nes->audio_out_fn)
+        return 0;
+    /* The payload is copied to an arbitrary JIT address.  Taking the address
+     * of an external function in this non-PIE ELF produces a link-time
+     * absolute address, which is not a valid runtime pointer after that copy.
+     * Force a PC-relative LEA so pthread starts inside the relocated image. */
+    void *thread_entry;
+    __asm__ volatile ("leaq apu_audio_thread(%%rip), %0"
+                      : "=r"(thread_entry));
+    nes->audio_thread_stop = 0;
+    nes->audio_thread_running = 1;
+    s32 rc = (s32)NC(G, pthread_create, (u64)thread, 0,
+                     (u64)thread_entry, (u64)nes, 0, 0);
+    if (rc != 0) {
+        nes->audio_thread_running = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static void stop_audio_thread(struct NES *nes, void *G, void *pthread_join,
+                              void *usleep, u64 thread, int *started) {
+    if (!*started) return;
+    __atomic_store_n(&nes->audio_thread_stop, 1, __ATOMIC_RELEASE);
+    if (pthread_join)
+        NC(G, pthread_join, thread, 0, 0, 0, 0, 0);
+    else if (usleep)
+        NC(G, usleep, 30000, 0, 0, 0, 0, 0);
+    nes->audio_thread_running = 0;
+    *started = 0;
 }
 
 /* True if roms[j].filename equals name (NUL-terminated, max 47). */
@@ -669,6 +704,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     void *kclose    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose");
     void *kmkdir    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir");
     void *delete_eq = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelDeleteEqueue");
+    void *pthread_create = SYM(G, D, LIBKERNEL_HANDLE, "pthread_create");
+    void *pthread_join   = SYM(G, D, LIBKERNEL_HANDLE, "pthread_join");
     void *recvfrom  = SYM(G, D, LIBKERNEL_HANDLE, "recvfrom");
     void *sendto    = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     void *accept    = SYM(G, D, LIBKERNEL_HANDLE, "accept");
@@ -765,6 +802,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         for (int h = 0; h < 8; h++) NC(G, aud_close, (u64)h, 0,0,0,0,0);
 
     s32 audio_h = -1;
+    u64 audio_thread = 0;
+    int audio_thread_started = 0;
     if (aud_open) {
         /* Prefer the signed-in user; fall back to 0xFF (system / everyone). */
         s32 aud_user = userId;
@@ -1202,6 +1241,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             udp_log(G, sendto, log_fd, log_sa, mbuf);
         }
 
+        audio_thread_started = start_audio_thread(nes, G, pthread_create, &audio_thread);
         apu_prime(nes, AUDIO_PRIME_BUFS);
 
         u32 frame = 0;
@@ -1445,11 +1485,16 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             ext->frame_count = total_frames;
         }
 
+        stop_audio_thread(nes, G, pthread_join, usleep,
+                          audio_thread, &audio_thread_started);
         if (!back_to_menu) break;
     }
 
 done:
     udp_log(G, sendto, log_fd, log_sa, "Shutting down...\n");
+
+    stop_audio_thread(nes, G, pthread_join, usleep,
+                      audio_thread, &audio_thread_started);
 
     if (aud_close && audio_h >= 0)
         NC(G, aud_close, (u64)audio_h, 0,0,0,0,0);
