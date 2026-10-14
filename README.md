@@ -4,7 +4,7 @@
   <img src="pNES5.png" alt="pNES5" width="280">
 </p>
 
-NES emulator for PS5 as native x86_64 shellcode, running through [LuaC0re](https://github.com/Gezine/Luac0re) (no kernel exploit). Tested up to firmware **13.00**.
+NES emulator for PS5 as native x86_64 shellcode, running through [LuaC0re](https://github.com/Gezine/Luac0re) (no kernel exploit). Tested up to firmware **13.60**; see the community test details below.
 
 Forked from [EmuC0re](https://github.com/egycnq/EmuC0re) (EgyDevTeam / egycnq). Same LuaC0re shellcode approach; this repo focuses on a single NES host with tighter APU/PPU behavior, DualSense controls, and an in-game settings menu.
 
@@ -54,10 +54,23 @@ Unsupported mappers will not run. MMC3 scanline IRQ is approximate (blargg `4-sc
 
 ## Requirements
 
-- PS5 (tested through 13.00)
+- PS5 (tested through 13.60; see the configuration below)
 - [LuaC0re](https://github.com/Gezine/Luac0re)
 - *Star Wars Racer Revenge* — US `CUSA03474` or EU `CUSA03492`
 - Python 3 on the PC, same LAN as the console
+
+## Community compatibility test
+
+A successful launch and game test was reported on PS5 firmware **13.60** with
+the EU version of *Star Wars Racer Revenge* (`CUSA03492`). The launcher connected
+to the emulator's FTP server and uploaded a ROM, and the tester confirmed that
+the game worked. This is a single-configuration smoke test, not validation of
+every game, feature, region, or intervening firmware version.
+
+The tested setup required the Lua compatibility changes in this payload:
+a local hex decoder, `jit_write_buffer` instead of `write_shellcode`, and a
+`write8` loop instead of `memset`. The exact installed Luac0re version was not
+verified. The native emulator binary was unchanged.
 
 ## Build & launch
 

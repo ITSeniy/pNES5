@@ -130,8 +130,14 @@ local ftp_srv = open_listen(1337, "ftp_srv")
 local ftp_data = open_listen(1338, "ftp_data")
 
 sc = sc:gsub("%s", "")
+local function hex_to_binary(hex)
+    return (hex:gsub("%x%x", function(byte)
+        return string.char(tonumber(byte, 16))
+    end))
+end
 local bin = hex_to_binary(sc)
 local JIT_SIZE = 0x10000
+assert(#bin <= JIT_SIZE, "NES payload exceeds allocated JIT memory")
 local bfd = jit_malloc(8)
 local rwfd = jit_malloc(8)
 local rxfd = jit_malloc(8)
@@ -147,7 +153,7 @@ local rw = jit_read64(rwa)
 local mfd = jit_send_recv_fd(jit_read32(rxfd), NEW_JIT_SOCK, NEW_MAIN_SOCK)
 sceKernelJitMapSharedMemory(mfd, PROT_READ|PROT_EXECUTE, rxa)
 local rx = read64(rxa)
-write_shellcode(rw, sc)
+jit_write_buffer(rw, bin)
 ulog("Code: " .. #bin .. " bytes")
 
 -- ext_args layout 
@@ -164,7 +170,8 @@ ulog("Code: " .. #bin .. " bytes")
 --   +0x50  u64 dbg[4]       FTP control fd (port 1337)
 --   +0x58  u64 dbg[5]       FTP data fd (port 1338)
 local ext = malloc(0x80)
-memset(ext, 0, 0x80)
+-- Older Luac0re versions do not expose memset.
+for i = 0, 0x7F do write8(ext + i, 0) end
 write64(ext+0x00, 0xDEAD)
 write32(ext+0x18, log_sock)
 write32(ext+0x1C, -1)
